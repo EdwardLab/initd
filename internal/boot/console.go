@@ -3,6 +3,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"golang.org/x/sys/unix"
 	"syscall"
 	"initd/internal/logging"
 )
@@ -13,9 +14,9 @@ func SetupConsole() {
 		if err != nil {
 			continue
 		}
-		_ = syscall.Dup2(int(f.Fd()), 0)
-		_ = syscall.Dup2(int(f.Fd()), 1)
-		_ = syscall.Dup2(int(f.Fd()), 2)
+		_ = unix.Dup2(int(f.Fd()), 0)
+		_ = unix.Dup2(int(f.Fd()), 1)
+		_ = unix.Dup2(int(f.Fd()), 2)
 		_ = f.Close()
 		return
 	}
@@ -69,15 +70,15 @@ func spawnGetty() error {
 	}
 
 	// stdin/stdout/stderr
-	if err := syscall.Dup2(int(tty.Fd()), 0); err != nil {
+	if err := unix.Dup2(int(tty.Fd()), 0); err != nil {
 		tty.Close()
 		return fmt.Errorf("dup2 stdin failed: %w", err)
 	}
-	if err := syscall.Dup2(int(tty.Fd()), 1); err != nil {
+	if err := unix.Dup2(int(tty.Fd()), 1); err != nil {
 		tty.Close()
 		return fmt.Errorf("dup2 stdout failed: %w", err)
 	}
-	if err := syscall.Dup2(int(tty.Fd()), 2); err != nil {
+	if err := unix.Dup2(int(tty.Fd()), 2); err != nil {
 		tty.Close()
 		return fmt.Errorf("dup2 stderr failed: %w", err)
 	}
