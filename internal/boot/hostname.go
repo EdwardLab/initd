@@ -23,7 +23,7 @@ func ApplyHostname() {
 	}
 
 	// 2. kernel cmdline override: hostname=
-	if cmd := readKernelCmdline(); cmd != "" {
+	if cmd := ReadKernelCmdline(); cmd != "" {
 		for _, field := range strings.Fields(cmd) {
 			if strings.HasPrefix(field, "hostname=") {
 				name = strings.TrimPrefix(field, "hostname=")
@@ -45,12 +45,4 @@ func ApplyHostname() {
 
 	logging.KernelPrintf(os.Stderr, "initd", 1,
 		"hostname set to %q", name)
-}
-
-func readKernelCmdline() string {
-	data, err := os.ReadFile("/proc/cmdline")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
 }

@@ -237,6 +237,26 @@ func (m *Manager) waitForUnitReady(unit *service.Unit, timeout time.Duration) er
 	return nil
 }
 
+func (m *Manager) StopAllUnits() {
+	units := m.ListUnits()
+
+	ordered := m.orderUnitsByAfter(units)
+
+	for i := len(ordered) - 1; i >= 0; i-- {
+		unit := ordered[i]
+		snap := unit.Snapshot()
+
+		if snap.State != service.StateActive &&
+			snap.State != service.StateActivating {
+			continue
+		}
+
+		unit.Log(logging.LevelInfo, "Stopping for system shutdown")
+		_ = unit.Stop(10 * time.Second)
+	}
+}
+
+
 func (m *Manager) StopUnit(name string) error {
 	unit, err := m.FindUnit(name)
 	if err != nil {
