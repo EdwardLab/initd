@@ -1,64 +1,148 @@
 # initd
 
-**Systemd-compatible service management for environments without PID 1**
+**A lightweight, systemd-compatible init system and service manager**
 
-`initd` is a lightweight init daemon that provides systemd-style service management
-without requiring systemd or PID 1.
+`initd` is a modern, lightweight init system and service manager designed as a
+practical replacement for systemd in constrained, containerized, and embedded
+Linux environments.
 
-It allows unmodified systemd service files to run normally in environments where
-systemd cannot run, such as Docker containers, Android chroot/proot, embedded systems,
-and other restricted Linux environments.
+It preserves the familiar systemd service model and `systemctl` workflow,
+while removing systemd’s heavy runtime dependencies and assumptions.
+
+`initd` can run either as a standalone service manager or as a full init
+process (PID 1).
+
+---
+
+## What is initd
+
+`initd` is an init system and service supervisor that runs unmodified
+systemd `*.service` files without requiring systemd itself.
+
+It is designed for environments where systemd is unavailable, restricted,
+or unnecessarily heavy, while still providing a clean and familiar
+operational experience.
+
+`initd` supports two primary modes of operation:
+
+- **Service-manager mode**  
+  Run as a daemon managing services, without PID 1 responsibilities.
+
+- **Init mode (PID 1)**  
+  Run as the system init process, performing essential system initialization
+  and full lifecycle management.
 
 ---
 
 ## Why initd
 
-In many environments, systemd is unavailable or impractical:
+Systemd is powerful, but it is not always suitable.
 
-- Docker containers (no PID 1 or restricted init)
+In many real-world Linux environments, systemd cannot run reliably or at all:
+
+- Containers (Docker, unshare, rootless environments)
 - Android chroot / proot
-- Embedded Linux systems
-- Minimal or constrained Linux environments
+- Embedded Linux and IoT devices
+- Minimal systems with limited memory or storage
+- Systems that prefer a simpler, more transparent init model
 
-As a result, users are often forced to:
-- Write custom startup scripts
-- Manually run daemons in separate terminals
-- Use ad-hoc supervisors instead of systemd services
+In these environments, users are often forced to:
 
-`initd` solves this by **keeping the systemd service model** while removing systemd’s
-heavy runtime requirements.
+- Write ad-hoc startup scripts
+- Manually launch and supervise daemons
+- Give up `systemctl` entirely
+- Reimplement basic init behavior
 
-You write normal `*.service` files.
-You use familiar `systemctl` commands.
-Services start automatically with the container or chroot.
+`initd` solves this by keeping the **systemd service model and operator
+experience**, while removing systemd’s heavy runtime stack.
+
+You write normal `*.service` files.  
+You use familiar `systemctl` commands.  
+Services behave as expected.
 
 ---
 
-## Features
+## Key Capabilities
 
-- Runs **unmodified systemd service files**
-- `systemctl` interface compatible with systemd usage
-- Does **not** require PID 1
-- Works in:
-  - Docker containers
-  - Android chroot / proot
-  - Embedded Linux
-- Uses a Unix domain socket (`/run/initd.sock`) instead of D-Bus
-- Can run as:
-  - a **service manager daemon**
-  - a **full init / supervisor**
+### Full init system (PID 1)
+
+When running as PID 1, `initd` provides core init functionality:
+
+- Acts as the system init process
+- Reaps zombie processes
+- Handles init-specific signal semantics
+- Remounts the root filesystem read-write
+- Applies system hostname
+- Spawns console login (getty or fallback shell)
+- Starts all enabled services automatically
+- Supports clean reboot, poweroff, and halt
+
+This makes `initd` suitable as a real init system, not just a supervisor.
+
+---
+
+### Systemd-compatible service management
+
+- Runs **unmodified systemd `*.service` files**
+- Familiar `systemctl` interface
+- Supports:
+  - start / stop / restart
+  - enable / disable
+  - status / is-active / is-enabled
+- Tracks:
+  - service state
+  - main PID
+  - start/stop timestamps
+  - last error
+  - service logs
+
+The goal is operational familiarity without systemd internals.
+
+---
+
+### System control commands
+
+`initd` supports system-level commands via `systemctl`:
+
+- `systemctl reboot`
+- `systemctl poweroff`
+- `systemctl halt`
+
+Shutdown is performed in a controlled manner:
+
+- New logins are disabled
+- Services are stopped gracefully
+- Filesystems are synchronized
+- Final system action is executed
+
+---
+
+### Minimal and dependency-free
+
+`initd` intentionally avoids complex subsystems:
+
+- No systemd
+- No D-Bus
+- No cgroups
+- No journald
+
+Communication uses a simple Unix domain socket.
+Access control relies on filesystem permissions.
+
+The design favors clarity, auditability, and predictability.
 
 ---
 
 ## Architecture
 
-- `initd` runs as a daemon and manages service lifecycles
-- `systemctl` communicates with `initd` via a Unix socket
-- No dependency on:
-  - systemd
-  - D-Bus
-  - cgroups
-- File permissions control access to the control socket
+`initd` follows a simple and explicit architecture:
+
+- `initd` manages system and service lifecycle
+- `systemctl` is a thin client communicating over a Unix socket
+- No background buses or hidden dependencies
+- Clear separation of responsibilities
+
+Unlike systemd, `initd` does not attempt to be a monolithic userspace platform.
 
 ---
 
@@ -67,29 +151,51 @@ Services start automatically with the container or chroot.
 ### initd
 
 ```sh
-./initd -h
-Usage of ./initd:
-  -init
-        run as init/supervisor
-  -socket string
-        path to initd unix socket (default "/run/initd.sock")
+Usage: initd [OPTIONS...]
+
+Default behavior:
+  Running initd with NO arguments defaults to init/supervisor mode (equivalent to --init).
+
+Options:
+  --init               Run as init/supervisor (autostart enabled units).
+  --socket[=PATH]      Run as a pure daemon/service manager without init/PID1 behaviors.
+                       If PATH omitted, defaults to /run/initd.sock.
+  -h, --help           Show this help.
+  -V, --version        Show version.
 ```
 
-Modes:
+### Modes of operation
 
-- **Socket-only mode (default)**
-   Starts the control daemon only
-   Does NOT automatically start services
-   (not recommended for normal use)
-- **Init mode (`--init`)**
-   Starts initd as a supervisor
-   Automatically starts all enabled services
-   Recommended for containers and chroot environments
+#### Init mode (recommended)
+
+- Runs as a full init system
+- Automatically starts all enabled services
+- Performs essential system initialization
+- Suitable for:
+  - Containers
+  - Chroot / proot
+  - Embedded Linux
+  - Minimal systems
+
+```
+initd (or initd --init)
+```
+
+#### Service-manager-only mode
+
+- Runs without PID 1 responsibilities
+- Manages services only
+- Useful when integrating into existing systems
+
+```
+initd --socket
+```
 
 ### systemctl
 
 ```
 systemctl [OPTIONS...] COMMAND [UNIT...]
+
 Query or send control commands to the initd system manager.
 
 Options:
@@ -97,7 +203,7 @@ Options:
   -h, --help           Show this help
   -V, --version        Show version
 
-Commands:
+Unit Commands:
   start UNIT...        Start (activate) one or more units
   stop UNIT...         Stop (deactivate) one or more units
   restart UNIT...      Restart one or more units
@@ -109,13 +215,17 @@ Commands:
   list-units           List loaded units
   list-unit-files      List installed unit files
   daemon-reload        Reload unit files
+System Commands:
+  reboot               Reboot the system
+  poweroff             Power off the system
+  halt                 Halt the system
 ```
 
-The usage is intentionally very close to systemd’s `systemctl`.
+The interface is intentionally close to systemd’s `systemctl`.
 
 ## Examples
 
-### Nginx
+### Starting nginx
 
 ```
 sudo systemctl start nginx
@@ -126,7 +236,9 @@ sudo systemctl status nginx
  Main PID: 12717
 ```
 
-### SSH
+------
+
+### SSH service
 
 ```
 sudo systemctl daemon-reload
@@ -140,41 +252,44 @@ Logs:
   INFO: Service type notify not supported; treating as simple
 ```
 
-### list-units
+------
+
+### Listing units
 
 ```
 systemctl list-units
-UNIT    LOAD    ACTIVE  DESCRIPTION
-ipp-usb.service loaded  inactive        Daemon for IPP over USB printer support
-systemd-journald.service        loaded  inactive        Journal Service
-systemd-suspend-then-hibernate.service  loaded  inactive        System Suspend then Hibernate
-......
+UNIT                                    LOAD    ACTIVE    DESCRIPTION
+nginx.service                           loaded  active    A high performance web server
+ssh.service                             loaded  active    OpenBSD Secure Shell server
+systemd-journald.service                loaded  inactive  Journal Service
 ```
 
 ------
 
 ## When to Use initd
 
-Recommended when:
+`initd` is recommended when:
 
-- systemd cannot run (no PID 1)
-- systemd is too heavy or restricted
+- systemd cannot run or is restricted
+- systemd is too heavy for the environment
 - You want systemd-style service management without systemd
+- You need a real init system with minimal overhead
 
-Especially useful for:
+It is especially useful for:
 
 - Docker containers
 - Android chroot / proot
-- Embedded Linux systems
+- Embedded Linux and IoT devices
+- Minimal or custom Linux systems
 
 ------
 
 ## Important Notes
 
-- Do **NOT** run `initd --init` together with systemd
-   Running two init systems simultaneously will cause conflicts
-- In environments where systemd is already active (e.g. WSL with systemd),
-   only use one init system at a time
+- Do **not** run `initd --init` alongside systemd
+   Running two init systems simultaneously will cause conflicts.
+- On systems where systemd is already active, only one init system
+   should manage services at a time.
 
 ------
 
@@ -201,18 +316,19 @@ Recommended installation path:
 /usr/local/bin
 ```
 
-This avoids conflicts with system-provided systemd binaries on Debian/Ubuntu systems.
+This avoids conflicts with system-provided systemd binaries on
+ Debian and Ubuntu systems.
 
-After installation, verify that `systemctl` points to the initd version.
+After installation, verify that `systemctl` refers to the initd version.
 
 ------
 
 ## Recommended Startup
 
-Use init mode for full service management:
+For full functionality, run initd in init mode:
 
 ```
-/usr/local/bin/initd --init
+/usr/local/bin/initd
 ```
 
 All enabled services will start automatically.

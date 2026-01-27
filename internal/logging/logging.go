@@ -17,7 +17,7 @@ const (
 )
 
 type Entry struct {
-	Timestamp time.Time
+	Timestamp time.Duration
 	Unit      string
 	PID       int
 	Level     Level
@@ -77,7 +77,7 @@ func (l *LineLogger) Write(p []byte) (int, error) {
 			continue
 		}
 		entry := Entry{
-			Timestamp: time.Now(),
+			Timestamp: MonotonicNow(),
 			Unit:      l.Unit,
 			PID:       l.PID,
 			Level:     l.Level,
@@ -85,12 +85,12 @@ func (l *LineLogger) Write(p []byte) (int, error) {
 		}
 		l.Buffer.Add(entry)
 		if l.Output != nil {
-			_, _ = fmt.Fprintf(l.Output, "%s %s[%d]: %s\n", entry.Timestamp.Format(time.RFC3339), entry.Unit, entry.PID, entry.Message)
+			_, _ = fmt.Fprintf(l.Output, "%s\n", FormatEntry(entry))
 		}
 	}
 	return len(p), nil
 }
 
 func FormatEntry(entry Entry) string {
-	return fmt.Sprintf("%s %s[%d] %s: %s", entry.Timestamp.Format(time.RFC3339), entry.Unit, entry.PID, entry.Level, entry.Message)
+	return fmt.Sprintf("[%s] %s[%d]: %s", formatMonotonic(entry.Timestamp), entry.Unit, entry.PID, entry.Message)
 }

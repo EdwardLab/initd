@@ -8,11 +8,12 @@ import (
 	"os"
 	"strings"
 	"time"
-
 	"initd/internal/ipc"
+
+	"golang.org/x/sys/unix"
 )
 
-const systemctlVersion = "0.0.1"
+const systemctlVersion = "0.0.2"
 
 func main() {
 	if wantsHelp(os.Args[1:]) {
@@ -49,12 +50,16 @@ func main() {
 			os.Exit(1)
 		}
 		handleUnitCommand(client, cmd, args[0])
+
 	case "list-units":
 		handleListUnits(client)
+
 	case "list-unit-files":
 		handleListUnitFiles(client)
-	case "daemon-reload":
+
+	case "daemon-reload", "reboot", "poweroff", "halt":
 		handleSimple(client, cmd)
+
 	default:
 		usage()
 		os.Exit(1)
@@ -173,16 +178,25 @@ func decodeStatus(resp ipc.Response) ipc.StatusData {
 }
 
 func printStatus(status ipc.StatusData, enabled string) {
-	loadedState := "loaded"
-	fmt.Printf("● %s - %s\n", status.Name, status.Description)
-	fmt.Printf("   Loaded: %s (%s; %s)\n", loadedState, status.Name, enabled)
+	unitBase := strings.TrimSuffix(status.Name, ".service")
 
-	activeLine := fmt.Sprintf("%s (running)", status.State)
-	if status.State != "active" {
-		activeLine = fmt.Sprintf("%s", status.State)
+	fmt.Printf("● %s - %s\n", status.Name, status.Description)
+	fmt.Printf("   Loaded: loaded (%s; %s)\n", status.Name, enabled)
+
+	activeLine := string(status.State)
+	if status.State == "active" {
+		activeLine = "active (running)"
 	}
+
 	if !status.StartedAt.IsZero() {
-		fmt.Printf("   Active: %s since %s\n", activeLine, status.StartedAt.Format(time.RFC1123))
+		startedAt := status.StartedAt.Local()
+		monotonicSince := formatSince(status.StartedAtMonotonic)
+		fmt.Printf(
+			"   Active: %s since %s; %s ago\n",
+			activeLine,
+			startedAt.Format("Mon, 02 Jan 2006 15:04:05 MST"),
+			monotonicSince,
+		)
 	} else {
 		fmt.Printf("   Active: %s\n", activeLine)
 	}
@@ -190,15 +204,69 @@ func printStatus(status ipc.StatusData, enabled string) {
 	if status.MainPID > 0 {
 		fmt.Printf(" Main PID: %d\n", status.MainPID)
 	}
+
 	if status.LastError != "" {
 		fmt.Printf("   Error: %s\n", status.LastError)
 	}
 
 	if len(status.Logs) > 0 {
 		fmt.Println("\nLogs:")
-		for _, line := range status.Logs {
-			fmt.Printf(" %s\n", strings.TrimSpace(line))
+		for _, raw := range status.Logs {
+			line := strings.TrimSpace(raw)
+
+			// strip kernel-style monotonic prefix: [1234.567890]
+			if strings.HasPrefix(line, "[") {
+				if idx := strings.Index(line, "]"); idx > 0 {
+					line = strings.TrimSpace(line[idx+1:])
+				}
+			}
+
+			// map unit[0] → systemd[1]
+			if strings.HasPrefix(line, status.Name+"[0]:") {
+				line = "systemd[1]:" + strings.TrimPrefix(line, status.Name+"[0]:")
+			}
+
+			// unit.service[pid] → unit[pid]
+			line = strings.ReplaceAll(line, status.Name+"[", unitBase+"[")
+
+			fmt.Printf(" %s\n", line)
 		}
+	}
+}
+
+
+func monotonicNow() time.Duration {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return 0
+	}
+	return time.Duration(ts.Sec)*time.Second + time.Duration(ts.Nsec)
+}
+
+func formatSince(start time.Duration) string {
+	if start <= 0 {
+		return "0s"
+	}
+	now := monotonicNow()
+	if now <= start {
+		return "0s"
+	}
+	delta := now - start
+	if delta < 0 {
+		return "0s"
+	}
+	delta = delta.Round(time.Second)
+	seconds := int(delta.Seconds())
+	hours := seconds / 3600
+	minutes := (seconds % 3600) / 60
+	secs := seconds % 60
+	switch {
+	case hours > 0:
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, secs)
+	case minutes > 0:
+		return fmt.Sprintf("%dm %ds", minutes, secs)
+	default:
+		return fmt.Sprintf("%ds", secs)
 	}
 }
 
@@ -256,7 +324,7 @@ func printHelp() {
 	fmt.Println("  -h, --help           Show this help")
 	fmt.Println("  -V, --version        Show version")
 	fmt.Println()
-	fmt.Println("Commands:")
+	fmt.Println("Unit Commands:")
 	fmt.Println("  start UNIT...        Start (activate) one or more units")
 	fmt.Println("  stop UNIT...         Stop (deactivate) one or more units")
 	fmt.Println("  restart UNIT...      Restart one or more units")
@@ -268,6 +336,10 @@ func printHelp() {
 	fmt.Println("  list-units           List loaded units")
 	fmt.Println("  list-unit-files      List installed unit files")
 	fmt.Println("  daemon-reload        Reload unit files")
+	fmt.Println("System Commands:")
+	fmt.Println("  reboot               Reboot the system")
+	fmt.Println("  poweroff             Power off the system")
+	fmt.Println("  halt                 Halt the system")
 	fmt.Println()
 	fmt.Println("Report bugs to: https://github.com/EdwardLab/initd")
 }

@@ -30,12 +30,14 @@ const (
 )
 
 type Runtime struct {
-	State      State
-	MainPID    int
-	ExitCode   int
-	LastError  string
-	StartedAt  time.Time
-	FinishedAt time.Time
+	State               State
+	MainPID             int
+	ExitCode            int
+	LastError           string
+	StartedAt           time.Time
+	FinishedAt          time.Time
+	StartedAtMonotonic  time.Duration
+	FinishedAtMonotonic time.Duration
 }
 
 type Unit struct {
@@ -48,6 +50,11 @@ type Unit struct {
 	restartHistory []time.Time
 	notifyFallback bool
 	startToken     int
+	reaper         ExitReaper
+}
+
+type ExitReaper interface {
+	Register(pid int, handler func(syscall.WaitStatus))
 }
 
 func NewUnit(config *parser.Unit, path string) *Unit {
@@ -59,6 +66,12 @@ func NewUnit(config *parser.Unit, path string) *Unit {
 			State: StateInactive,
 		},
 	}
+}
+
+func (u *Unit) SetReaper(reaper ExitReaper) {
+	u.mu.Lock()
+	u.reaper = reaper
+	u.mu.Unlock()
 }
 
 func (u *Unit) Description() string {
@@ -87,6 +100,8 @@ func (u *Unit) Start() (int, error) {
 	u.Runtime.LastError = ""
 	u.Runtime.ExitCode = 0
 	u.Runtime.FinishedAt = time.Time{}
+	u.Runtime.FinishedAtMonotonic = 0
+	u.Runtime.StartedAtMonotonic = 0
 	u.Runtime.MainPID = 0
 	u.mu.Unlock()
 
@@ -174,6 +189,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	}
 	u.Cmd = cmd
 	u.Runtime.StartedAt = time.Now()
+	u.Runtime.StartedAtMonotonic = logging.MonotonicNow()
 	stdoutLogger.PID = cmd.Process.Pid
 	stderrLogger.PID = cmd.Process.Pid
 	switch serviceType {
@@ -187,6 +203,14 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	}
 	u.mu.Unlock()
 
+	if u.reaper != nil {
+		resetActive := serviceType == "simple"
+		pid := cmd.Process.Pid
+		u.reaper.Register(pid, func(status syscall.WaitStatus) {
+			u.handleExitStatus(token, status, ignoreFailure, resetActive)
+		})
+	}
+
 	switch serviceType {
 	case "oneshot":
 		go u.waitOneshot(token, ignoreFailure)
@@ -198,17 +222,24 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 }
 
 func (u *Unit) waitSimple(token int, ignoreFailure bool) {
+	if u.reaper != nil {
+		return
+	}
 	err := u.Cmd.Wait()
 	u.handleExit(token, err, ignoreFailure, true)
 }
 
 func (u *Unit) waitOneshot(token int, ignoreFailure bool) {
+	if u.reaper != nil {
+		return
+	}
 	err := u.Cmd.Wait()
 	u.handleExit(token, err, ignoreFailure, false)
 }
 
 func (u *Unit) waitForking(token int, ignoreFailure bool) {
 	startedAt := time.Now()
+	startedAtMonotonic := logging.MonotonicNow()
 	timeout := 2 * time.Second
 	poll := 100 * time.Millisecond
 
@@ -222,14 +253,18 @@ func (u *Unit) waitForking(token int, ignoreFailure bool) {
 	}
 
 	u.mu.Lock()
-	if u.startToken != token {
+	if u.startToken != token || u.Runtime.State == StateFailed {
 		u.mu.Unlock()
 		return
 	}
 	u.Runtime.State = StateActive
 	u.Runtime.MainPID = pid
 	u.Runtime.StartedAt = startedAt
+	u.Runtime.StartedAtMonotonic = startedAtMonotonic
 	u.mu.Unlock()
+	if u.reaper != nil {
+		return
+	}
 
 	err = u.Cmd.Wait()
 	if err != nil {
@@ -432,6 +467,38 @@ func (u *Unit) readPIDFile() (int, error) {
 }
 
 func (u *Unit) handleExit(token int, err error, ignoreFailure bool, resetActive bool) {
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				exitCode = status.ExitStatus()
+			}
+		}
+	}
+	u.handleExitCode(token, exitCode, err, ignoreFailure, resetActive)
+}
+
+func (u *Unit) handleExitStatus(token int, status syscall.WaitStatus, ignoreFailure bool, resetActive bool) {
+	exitCode := 0
+	var err error
+	switch {
+	case status.Exited():
+		exitCode = status.ExitStatus()
+		if exitCode != 0 {
+			err = fmt.Errorf("exit status %d", exitCode)
+		}
+	case status.Signaled():
+		exitCode = 128 + int(status.Signal())
+		err = fmt.Errorf("terminated by signal %s", status.Signal())
+	default:
+		err = fmt.Errorf("process exited")
+		exitCode = 1
+	}
+	u.handleExitCode(token, exitCode, err, ignoreFailure, resetActive)
+}
+
+func (u *Unit) handleExitCode(token int, exitCode int, err error, ignoreFailure bool, resetActive bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.startToken != token {
@@ -447,20 +514,17 @@ func (u *Unit) handleExit(token int, err error, ignoreFailure bool, resetActive 
 			u.Runtime.State = StateFailed
 		}
 		u.Runtime.LastError = err.Error()
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				u.Runtime.ExitCode = status.ExitStatus()
-			}
-		}
+		u.Runtime.ExitCode = exitCode
 	} else {
 		if u.Runtime.State == StateActive && resetActive {
 			u.Runtime.State = StateInactive
 		} else if u.Runtime.State != StateActive {
 			u.Runtime.State = StateInactive
 		}
-		u.Runtime.ExitCode = 0
+		u.Runtime.ExitCode = exitCode
 	}
 	u.Runtime.FinishedAt = time.Now()
+	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 
 	if ignoreFailure {
 		if u.Runtime.State != StateActive {
@@ -475,7 +539,7 @@ func (u *Unit) Log(level logging.Level, message string) {
 	pid := u.Runtime.MainPID
 	u.mu.Unlock()
 	u.Logs.Add(logging.Entry{
-		Timestamp: time.Now(),
+		Timestamp: logging.MonotonicNow(),
 		Unit:      u.Config.Name,
 		PID:       pid,
 		Level:     level,
@@ -569,6 +633,7 @@ func (u *Unit) transitionState(next State, reason string) {
 		u.Runtime.LastError = reason
 	}
 	u.Runtime.FinishedAt = time.Now()
+	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 }
 
 func (u *Unit) markFailed(err error, ignoreFailure bool) {
@@ -582,6 +647,7 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 	u.Runtime.ExitCode = 1
 	u.Runtime.MainPID = 0
 	u.Runtime.FinishedAt = time.Now()
+	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 	u.mu.Unlock()
 }
 
@@ -649,6 +715,20 @@ func (u *Unit) runCommand(command string, envMap map[string]string, envList []st
 	}
 	stdoutLogger.PID = cmd.Process.Pid
 	stderrLogger.PID = cmd.Process.Pid
+	if u.reaper != nil {
+		done := make(chan syscall.WaitStatus, 1)
+		u.reaper.Register(cmd.Process.Pid, func(status syscall.WaitStatus) {
+			done <- status
+		})
+		status := <-done
+		if err := waitStatusError(status); err != nil {
+			if ignoreFailure {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
 	if err := cmd.Wait(); err != nil {
 		if ignoreFailure {
 			return nil
@@ -704,4 +784,18 @@ func (u *Unit) RestartPreventExitStatus() map[int]struct{} {
 		}
 	}
 	return result
+}
+
+func waitStatusError(status syscall.WaitStatus) error {
+	switch {
+	case status.Exited():
+		if status.ExitStatus() != 0 {
+			return fmt.Errorf("exit status %d", status.ExitStatus())
+		}
+		return nil
+	case status.Signaled():
+		return fmt.Errorf("terminated by signal %s", status.Signal())
+	default:
+		return fmt.Errorf("process exited")
+	}
 }

@@ -12,6 +12,8 @@ type Unit struct {
 	Name                string
 	Description         string
 	After               []string
+	Requires            []string
+	Wants               []string
 	ConditionPathExists []string
 	Service             ServiceSection
 	Install             InstallSection
@@ -91,6 +93,10 @@ func ParseUnit(path string) (*Unit, error) {
 				unit.Description = value
 			case "After":
 				unit.After = splitList(value)
+			case "Requires":
+				unit.Requires = splitList(value)
+			case "Wants":
+				unit.Wants = splitList(value)
 			case "ConditionPathExists":
 				unit.ConditionPathExists = append(unit.ConditionPathExists, value)
 			}

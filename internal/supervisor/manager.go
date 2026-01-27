@@ -17,9 +17,11 @@ import (
 
 type Manager struct {
 	mu          sync.Mutex
+	startMu     sync.Mutex
 	Units       map[string]*service.Unit
 	SearchPaths []string
 	UnitOrder   []string
+	reaper      service.ExitReaper
 }
 
 func NewManager() *Manager {
@@ -31,6 +33,15 @@ func NewManager() *Manager {
 			"/usr/lib/systemd/system",
 		},
 	}
+}
+
+func (m *Manager) SetReaper(reaper service.ExitReaper) {
+	m.mu.Lock()
+	m.reaper = reaper
+	for _, unit := range m.Units {
+		unit.SetReaper(reaper)
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) LoadUnits() error {
@@ -55,7 +66,11 @@ func (m *Manager) LoadUnits() error {
 				continue
 			}
 			unitConfig.Name = entry.Name()
-			units[entry.Name()] = service.NewUnit(unitConfig, path)
+			unit := service.NewUnit(unitConfig, path)
+			if m.reaper != nil {
+				unit.SetReaper(m.reaper)
+			}
+			units[entry.Name()] = unit
 			order = append(order, entry.Name())
 		}
 	}
@@ -77,15 +92,44 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 }
 
 func (m *Manager) StartUnit(name string) error {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
+	started := map[string]struct{}{}
+	stack := map[string]struct{}{}
+	return m.startUnitWithDependencies(name, started, stack)
+}
+
+func (m *Manager) startUnitWithDependencies(name string, started map[string]struct{}, stack map[string]struct{}) error {
+	if _, ok := started[name]; ok {
+		return nil
+	}
+	if _, ok := stack[name]; ok {
+		logKernelWarning(fmt.Sprintf("Dependency cycle detected while starting %s; breaking cycle.", name))
+		return nil
+	}
+
 	unit, err := m.FindUnit(name)
 	if err != nil {
 		return err
 	}
+	stack[name] = struct{}{}
+
+	deps := m.collectDependencies(unit)
+	if err := m.startDependencies(unit, deps, started, stack); err != nil {
+		unit.MarkFailed(err.Error())
+		delete(stack, name)
+		return err
+	}
+
 	token, err := unit.Start()
 	if err != nil {
+		delete(stack, name)
 		return err
 	}
 	m.applyRestartPolicy(unit, token)
+	started[name] = struct{}{}
+	delete(stack, name)
 	return nil
 }
 
@@ -94,15 +138,102 @@ func (m *Manager) StartEnabledUnits() error {
 	if err != nil {
 		return err
 	}
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
 	ordered := m.orderUnitsByAfter(units)
+	started := map[string]struct{}{}
 	for _, unit := range ordered {
-		token, err := unit.Start()
-		if err != nil {
+		if err := m.startUnitWithDependencies(unit.Config.Name, started, map[string]struct{}{}); err != nil {
 			unit.Log(logging.LevelError, fmt.Sprintf("Failed to start enabled unit: %v", err))
+		}
+	}
+	return nil
+}
+
+type dependency struct {
+	name     string
+	required bool
+}
+
+func (m *Manager) collectDependencies(unit *service.Unit) []dependency {
+	deps := make([]dependency, 0, len(unit.Config.Requires)+len(unit.Config.Wants))
+	seen := map[string]struct{}{}
+	add := func(name string, required bool) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		deps = append(deps, dependency{name: name, required: required})
+	}
+	for _, dep := range unit.Config.Requires {
+		add(dep, true)
+	}
+	for _, dep := range unit.Config.Wants {
+		add(dep, false)
+	}
+	return deps
+}
+
+func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, started map[string]struct{}, stack map[string]struct{}) error {
+	if len(deps) == 0 {
+		return nil
+	}
+
+	depUnits := make([]*service.Unit, 0, len(deps))
+	depMeta := make(map[string]dependency, len(deps))
+	for _, dep := range deps {
+		depUnit, err := m.FindUnit(dep.name)
+		if err != nil {
+			if dep.required {
+				return fmt.Errorf("required unit %s not found", dep.name)
+			}
+			unit.Log(logging.LevelError, fmt.Sprintf("Wanted unit %s not found", dep.name))
 			continue
 		}
-		m.applyRestartPolicy(unit, token)
+		depUnits = append(depUnits, depUnit)
+		depMeta[depUnit.Config.Name] = dep
 	}
+
+	ordered := m.orderUnitsByAfter(depUnits)
+	for _, depUnit := range ordered {
+		meta := depMeta[depUnit.Config.Name]
+		if err := m.startUnitWithDependencies(depUnit.Config.Name, started, stack); err != nil {
+			if meta.required {
+				return fmt.Errorf("required unit %s failed: %w", depUnit.Config.Name, err)
+			}
+			unit.Log(logging.LevelError, fmt.Sprintf("Wanted unit %s failed: %v", depUnit.Config.Name, err))
+			continue
+		}
+		if meta.required {
+			if err := m.waitForUnitReady(depUnit, 30*time.Second); err != nil {
+				return fmt.Errorf("required unit %s failed: %w", depUnit.Config.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) waitForUnitReady(unit *service.Unit, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		snapshot := unit.Snapshot()
+		if snapshot.State == service.StateFailed {
+			if snapshot.LastError != "" {
+				return errors.New(snapshot.LastError)
+			}
+			return fmt.Errorf("unit %s failed", unit.Config.Name)
+		}
+		if snapshot.State != service.StateActivating && snapshot.State != service.StateStopping {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	logKernelWarning(fmt.Sprintf("Timeout waiting for %s to finish activating; continuing.", unit.Config.Name))
 	return nil
 }
 
@@ -372,7 +503,12 @@ func (m *Manager) orderUnitsByAfter(units []*service.Unit) []*service.Unit {
 
 	if len(sorted) != len(units) {
 		// Best-effort ordering: on cycles fall back to file order.
+		logKernelWarning("After= dependency cycle detected; falling back to file order.")
 		return units
 	}
 	return sorted
+}
+
+func logKernelWarning(message string) {
+	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "%s", message)
 }

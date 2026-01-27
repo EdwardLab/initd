@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"initd/internal/boot"
 	"initd/internal/logging"
 	"initd/internal/service"
 	"initd/internal/supervisor"
@@ -23,14 +24,16 @@ type Response struct {
 }
 
 type StatusData struct {
-	Name        string        `json:"name"`
-	Description string        `json:"description"`
-	State       service.State `json:"state"`
-	MainPID     int           `json:"main_pid"`
-	StartedAt   time.Time     `json:"started_at"`
-	FinishedAt  time.Time     `json:"finished_at"`
-	LastError   string        `json:"last_error"`
-	Logs        []string      `json:"logs"`
+	Name                string        `json:"name"`
+	Description         string        `json:"description"`
+	State               service.State `json:"state"`
+	MainPID             int           `json:"main_pid"`
+	StartedAt           time.Time     `json:"started_at"`
+	FinishedAt          time.Time     `json:"finished_at"`
+	StartedAtMonotonic  time.Duration `json:"started_at_monotonic"`
+	FinishedAtMonotonic time.Duration `json:"finished_at_monotonic"`
+	LastError           string        `json:"last_error"`
+	Logs                []string      `json:"logs"`
 }
 
 type UnitData struct {
@@ -106,14 +109,16 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			logLines = append(logLines, logging.FormatEntry(entry))
 		}
 		return Response{Success: true, Data: StatusData{
-			Name:        unit.Config.Name,
-			Description: unit.Description(),
-			State:       snapshot.State,
-			MainPID:     snapshot.MainPID,
-			StartedAt:   snapshot.StartedAt,
-			FinishedAt:  snapshot.FinishedAt,
-			LastError:   snapshot.LastError,
-			Logs:        logLines,
+			Name:                unit.Config.Name,
+			Description:         unit.Description(),
+			State:               snapshot.State,
+			MainPID:             snapshot.MainPID,
+			StartedAt:           snapshot.StartedAt,
+			FinishedAt:          snapshot.FinishedAt,
+			StartedAtMonotonic:  snapshot.StartedAtMonotonic,
+			FinishedAtMonotonic: snapshot.FinishedAtMonotonic,
+			LastError:           snapshot.LastError,
+			Logs:                logLines,
 		}}
 	case "is-active":
 		unit, err := manager.FindUnit(req.Unit)
@@ -168,6 +173,11 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		if err := manager.Reload(); err != nil {
 			return Response{Success: false, Message: err.Error()}
 		}
+		return Response{Success: true}
+	case "reboot", "poweroff", "halt":
+		go func() {
+			boot.Shutdown(manager, req.Action)
+		}()
 		return Response{Success: true}
 	default:
 		return Response{Success: false, Message: "unknown action"}
