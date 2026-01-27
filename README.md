@@ -2,6 +2,8 @@
 
 **A lightweight, systemd-compatible init system and service manager**
 
+![debian-systemctl](imgs/debian-systemctl.png)
+
 `initd` is a modern, lightweight init system and service manager designed as a
 practical replacement for systemd in constrained, containerized, and embedded
 Linux environments.
@@ -323,15 +325,113 @@ After installation, verify that `systemctl` refers to the initd version.
 
 ------
 
-## Recommended Startup
+## Recommended Startup on Bare Metal / VM (PID 1)
 
-For full functionality, run initd in init mode:
+For full init functionality, `initd` can be used as the system init (PID 1).
+
+### Option 1: Boot directly as init (recommended)
+
+The most robust way is to let the Linux kernel start `initd` as PID 1 using the `init=` kernel parameter.
+
+#### Temporary (GRUB menu, one-time test)
+
+At the GRUB menu:
+
+1. Select your boot entry
+2. Press `e`
+3. Append the following to the `linux` line:
+
+```
+init=/usr/local/bin/initd
+```
+
+1. Boot with `Ctrl+X` or `F10`
+
+This is the safest way to test `initd` as PID 1 without modifying the system permanently.
+
+------
+
+#### Permanent (GRUB configuration)
+
+Edit `/etc/default/grub`:
+
+```
+GRUB_CMDLINE_LINUX="init=/usr/local/bin/initd"
+```
+
+Then regenerate GRUB:
+
+```
+grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+or on Debian/Ubuntu:
+
+```
+update-grub
+```
+
+After reboot, `initd` will be started directly by the kernel as PID 1.
+
+------
+
+### Option 2: Replace `/sbin/init` (not recommended)
+
+It is technically possible to replace the system init binary:
+
+```
+ln -sf /usr/local/bin/initd /sbin/init
+```
+
+However, this approach is **not recommended**:
+
+- Package managers may overwrite `/sbin/init`
+- Recovery becomes harder if boot fails
+- Harder to revert without rescue media
+
+Using `init=` via kernel parameters is cleaner, reversible, and distribution-agnostic.
+
+------
+
+## Recommended Startup for Containers / Docker / Chroot / Proot
+
+In containerized or chroot environments where PID 1 is not available, run `initd` in **init-lite mode**:
 
 ```
 /usr/local/bin/initd
+# or explicitly
+/usr/local/bin/initd --init
 ```
 
-All enabled services will start automatically.
+In this mode:
+
+- No PID 1 assumptions are made
+- All enabled systemd-style services are started
+- Signal handling and service supervision still work
+- Suitable for Docker, chroot, Android, WSL, and embedded environments
+
+------
+
+## Notes
+
+- `initd` automatically detects whether it is running as PID 1
+- `--init` on non-PID 1 systems enters *init-lite mode*
+- No systemd binary or PID 1 privileges are required for service management
+
+## Images
+
+Booting on debian:
+
+![debian-booting](imgs/debian-booting.png)
+
+
+
+![debian-initd](imgs/debian-initd.png)
+
+On Android Chroot:
+![android-xfce](imgs/android-xfce.jpg)
+
+![termux-initd](imgs/termux-initd.jpg)
 
 ------
 
