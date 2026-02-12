@@ -246,7 +246,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// Register reaper first (avoid race)
 	// -------------------------------------------------
 	if u.reaper != nil {
-		resetActive := serviceType == "simple" || serviceType == "notify"
+		resetActive := serviceType == "simple"
 		pid := cmd.Process.Pid
 
 		u.reaper.Register(pid, func(status syscall.WaitStatus) {
@@ -954,18 +954,9 @@ func (u *Unit) waitNotify(token int, ignoreFailure bool) {
 		}
 		u.mu.Unlock()
 
-		server.Stop()
-
-		if u.reaper == nil {
-			go u.waitSimple(token, ignoreFailure)
-		}
-
 		return
 
-
 	case <-timer.C:
-		// Timeout waiting for READY=1
-
 		u.mu.Lock()
 		if u.startToken != token {
 			u.mu.Unlock()
@@ -974,35 +965,12 @@ func (u *Unit) waitNotify(token int, ignoreFailure bool) {
 		cmd = u.Cmd
 		u.mu.Unlock()
 
-		// If process is still alive, fallback to simple behavior
-		if cmd != nil && cmd.Process != nil && processAlive(cmd.Process.Pid) {
-			u.mu.Lock()
-			u.Runtime.State = StateActive
-			u.Runtime.MainPID = cmd.Process.Pid
-			u.mu.Unlock()
-
-			server.Stop()
-			return
+		if cmd != nil && cmd.Process != nil {
+			u.killMainProcess(syscall.SIGTERM)
 		}
 
-		// Otherwise terminate service
-		u.killMainProcess(syscall.SIGTERM)
-
-		// Avoid zombie if no reaper
-		if u.reaper == nil && cmd != nil {
-			done := make(chan error, 1)
-			go func() { done <- cmd.Wait() }()
-
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				u.killMainProcess(syscall.SIGKILL)
-				<-done
-			}
-		}
-
-		server.Stop()
 		u.markFailed(fmt.Errorf("notify timeout"), ignoreFailure)
 		return
 	}
 }
+
