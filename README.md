@@ -146,6 +146,38 @@ The design favors clarity, auditability, and predictability.
 
 Unlike systemd, `initd` does not attempt to be a monolithic userspace platform.
 
+
+
+## Service Type Compatibility
+
+initd implements the most commonly used systemd service types and provides safe fallback behavior for less frequently used types.
+
+Supported types:
+
+- simple
+   The default service type. The service is considered started immediately after the main process is spawned.
+- oneshot
+   The service runs a single task and exits. The unit becomes inactive after completion.
+- forking
+   The service is expected to fork and write a PID file. initd waits for the PID file to appear and treats that PID as the main process.
+- notify / notify-reload
+   initd implements systemd-style NOTIFY_SOCKET support. The service becomes active after READY=1 is received. If READY is not received but the process remains alive, initd safely falls back to simple behavior.
+
+Other types:
+
+- exec
+- idle
+- dbus
+- any unknown value
+
+These are treated as simple for compatibility.
+
+Rationale
+
+The goal of initd is to provide practical compatibility with the most commonly deployed systemd units, especially in containers, embedded systems, and minimal environments.
+
+Less frequently used service types are safely degraded to simple mode rather than causing startup failure. This ensures predictable behavior while keeping initd lightweight and dependency-free.
+
 ---
 
 ## Usage
@@ -245,13 +277,11 @@ sudo systemctl status nginx
 ```
 sudo systemctl daemon-reload
 sudo systemctl status ssh
+edward@debian-initd:~$ sudo systemctl status ssh
 ● ssh.service - OpenBSD Secure Shell server
    Loaded: loaded (ssh.service; enabled)
-   Active: active (running) since Mon, 26 Jan 2026 22:57:51 PST
- Main PID: 12739
-
-Logs:
-  INFO: Service type notify not supported; treating as simple
+   Active: active (running) since Thu, 12 Feb 2026 15:36:16 AWST; 27m 59s ago
+ Main PID: 438
 ```
 
 ------
@@ -304,8 +334,7 @@ It is especially useful for:
 ### Build commands
 
 ```
-go build ./cmd/initd
-go build ./cmd/systemctl
+make build
 ```
 
 ------
@@ -432,6 +461,12 @@ On Android Chroot:
 ![android-xfce](imgs/android-xfce.jpg)
 
 ![termux-initd](imgs/termux-initd.jpg)
+
+On Docker:
+
+![initd-docker](imgs/initd-docker.png)
+
+![systemctl](imgs/systemctl.png)
 
 ------
 

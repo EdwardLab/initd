@@ -31,5 +31,6 @@ go.work.sum
 # .idea/
 # .vscode/
 releases/
+build/
 systemctl
 initd

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"initd/internal/notify"
 
 	"initd/internal/logging"
 	"initd/internal/parser"
@@ -48,9 +49,9 @@ type Unit struct {
 	Cmd            *exec.Cmd
 	Logs           *logging.Buffer
 	restartHistory []time.Time
-	notifyFallback bool
 	startToken     int
 	reaper         ExitReaper
+	notifyServer   *notify.Server
 }
 
 type ExitReaper interface {
@@ -164,62 +165,110 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		return
 	}
 
+	serviceType := u.canonicalServiceType()
+
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = envList
 	cmd.Dir = filepath.Dir(u.Path)
 
-	stdoutLogger := &logging.LineLogger{Unit: u.Config.Name, PID: 0, Level: logging.LevelInfo, Buffer: u.Logs, Output: os.Stdout}
-	stderrLogger := &logging.LineLogger{Unit: u.Config.Name, PID: 0, Level: logging.LevelError, Buffer: u.Logs, Output: os.Stderr}
+	// -------------------------------------------------
+	// Proper notify socket creation
+	// -------------------------------------------------
+	if serviceType == "notify" {
+		server, err := notify.Start()
+		if err != nil {
+			u.markFailed(fmt.Errorf("notify socket create failed: %w", err), ignoreFailure)
+			return
+		}
+
+		envList = append(envList, "NOTIFY_SOCKET="+server.Path)
+
+		u.mu.Lock()
+		u.notifyServer = server
+		u.mu.Unlock()
+	}
+
+	cmd.Env = envList
+
+	stdoutLogger := &logging.LineLogger{
+		Unit:   u.Config.Name,
+		PID:    0,
+		Level:  logging.LevelInfo,
+		Buffer: u.Logs,
+		Output: os.Stdout,
+	}
+	stderrLogger := &logging.LineLogger{
+		Unit:   u.Config.Name,
+		PID:    0,
+		Level:  logging.LevelError,
+		Buffer: u.Logs,
+		Output: os.Stderr,
+	}
+
 	cmd.Stdout = stdoutLogger
 	cmd.Stderr = stderrLogger
 
 	if err := cmd.Start(); err != nil {
 		u.markFailed(err, ignoreFailure)
+
+		u.mu.Lock()
+		if u.notifyServer != nil {
+			u.notifyServer.Stop()
+			u.notifyServer = nil
+		}
+		u.mu.Unlock()
+
 		return
 	}
 
-	serviceType := u.canonicalServiceType()
-
 	u.mu.Lock()
+
 	if u.startToken != token {
 		u.mu.Unlock()
 		_ = cmd.Process.Kill()
 		return
 	}
+
 	u.Cmd = cmd
 	u.Runtime.StartedAt = time.Now()
 	u.Runtime.StartedAtMonotonic = logging.MonotonicNow()
 	stdoutLogger.PID = cmd.Process.Pid
 	stderrLogger.PID = cmd.Process.Pid
-	switch serviceType {
-	case "oneshot":
-		u.Runtime.MainPID = cmd.Process.Pid
-	case "forking":
-		u.Runtime.State = StateActivating
-	default:
-		u.Runtime.MainPID = cmd.Process.Pid
+
+	if serviceType == "simple" {
 		u.Runtime.State = StateActive
+		u.Runtime.MainPID = cmd.Process.Pid
 	}
+
 	u.mu.Unlock()
 
+	// -------------------------------------------------
+	// Register reaper first (avoid race)
+	// -------------------------------------------------
 	if u.reaper != nil {
-		resetActive := serviceType == "simple"
+		resetActive := serviceType == "simple" || serviceType == "notify"
 		pid := cmd.Process.Pid
+
 		u.reaper.Register(pid, func(status syscall.WaitStatus) {
 			u.handleExitStatus(token, status, ignoreFailure, resetActive)
 		})
 	}
 
+	// -------------------------------------------------
+	// Dispatch wait handlers
+	// -------------------------------------------------
 	switch serviceType {
 	case "oneshot":
 		go u.waitOneshot(token, ignoreFailure)
 	case "forking":
 		go u.waitForking(token, ignoreFailure)
+	case "notify":
+		go u.waitNotify(token, ignoreFailure)
 	default:
 		go u.waitSimple(token, ignoreFailure)
 	}
 }
+
 
 func (u *Unit) waitSimple(token int, ignoreFailure bool) {
 	if u.reaper != nil {
@@ -278,6 +327,15 @@ func (u *Unit) waitForking(token int, ignoreFailure bool) {
 }
 
 func (u *Unit) Stop(timeout time.Duration) error {
+	defer func() {
+		u.mu.Lock()
+		if u.notifyServer != nil {
+			u.notifyServer.Stop()
+			u.notifyServer = nil
+		}
+		u.mu.Unlock()
+	}()
+
 	stopCommand := strings.TrimSpace(u.Config.Service.ExecStop)
 	if stopCommand != "" {
 		if err := u.runStopCommand(stopCommand); err != nil {
@@ -295,8 +353,43 @@ func (u *Unit) Stop(timeout time.Duration) error {
 	}
 	u.Runtime.State = StateStopping
 	pid := u.Runtime.MainPID
+	cmd := u.Cmd
 	u.mu.Unlock()
 
+	// -----------------------------
+	// Special handling for notify
+	// -----------------------------
+	if serviceType == "notify" {
+		if pid != 0 {
+			// Respect KillMode=process
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+
+		if u.reaper == nil && cmd != nil {
+			done := make(chan error, 1)
+			go func() {
+				done <- cmd.Wait()
+			}()
+
+			select {
+			case <-done:
+				// Clean exit
+			case <-time.After(timeout):
+				// Escalate
+				if pid != 0 {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+				<-done
+			}
+		}
+
+		u.transitionState(StateInactive, "")
+		return nil
+	}
+
+	// -----------------------------
+	// Forking handling
+	// -----------------------------
 	if serviceType == "forking" {
 		if pid == 0 {
 			if mainPID, err := u.readPIDFile(); err == nil {
@@ -307,6 +400,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 			_ = syscall.Kill(pid, syscall.SIGTERM)
 		}
 	} else {
+		// simple / others
 		if pid != 0 {
 			if killProcessGroup {
 				_ = syscall.Kill(-pid, syscall.SIGTERM)
@@ -317,6 +411,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 	}
 
 	deadline := time.Now().Add(timeout)
+
 	for time.Now().Before(deadline) {
 		if serviceType == "forking" {
 			if pid == 0 || !processAlive(pid) {
@@ -332,6 +427,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 
+	// Timeout escalation
 	if serviceType == "forking" {
 		if pid != 0 {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
@@ -345,9 +441,11 @@ func (u *Unit) Stop(timeout time.Duration) error {
 			}
 		}
 	}
+
 	u.transitionState(StateFailed, "terminated after timeout")
 	return errors.New("stop timeout")
 }
+
 
 func (u *Unit) Restart(timeout time.Duration) error {
 	if err := u.Stop(timeout); err != nil {
@@ -501,12 +599,28 @@ func (u *Unit) handleExitStatus(token int, status syscall.WaitStatus, ignoreFail
 func (u *Unit) handleExitCode(token int, exitCode int, err error, ignoreFailure bool, resetActive bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
 	if u.startToken != token {
 		return
 	}
+
+	// Respect RestartPreventExitStatus
+	if prevent := u.RestartPreventExitStatus(); prevent != nil {
+		if _, blocked := prevent[exitCode]; blocked {
+			return
+		}
+	}
+
+	// Cleanup notify socket
+	if u.notifyServer != nil {
+		u.notifyServer.Stop()
+		u.notifyServer = nil
+	}
+
 	if u.Runtime.State == StateActive && resetActive {
 		u.Runtime.MainPID = 0
 	}
+
 	if err != nil {
 		if u.Runtime.State == StateActive && resetActive {
 			u.Runtime.State = StateInactive
@@ -516,13 +630,12 @@ func (u *Unit) handleExitCode(token int, exitCode int, err error, ignoreFailure 
 		u.Runtime.LastError = err.Error()
 		u.Runtime.ExitCode = exitCode
 	} else {
-		if u.Runtime.State == StateActive && resetActive {
-			u.Runtime.State = StateInactive
-		} else if u.Runtime.State != StateActive {
+		if u.Runtime.State != StateActive {
 			u.Runtime.State = StateInactive
 		}
 		u.Runtime.ExitCode = exitCode
 	}
+
 	u.Runtime.FinishedAt = time.Now()
 	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 
@@ -533,6 +646,7 @@ func (u *Unit) handleExitCode(token int, exitCode int, err error, ignoreFailure 
 		}
 	}
 }
+
 
 func (u *Unit) Log(level logging.Level, message string) {
 	u.mu.Lock()
@@ -593,33 +707,25 @@ func processAlive(pid int) bool {
 
 func (u *Unit) canonicalServiceType() string {
 	serviceType := strings.ToLower(strings.TrimSpace(u.Config.Service.Type))
-	switch serviceType {
-	case "forking", "oneshot", "simple", "idle", "exec", "dbus", "notify", "notify-reload":
-		if serviceType == "dbus" {
-			u.Log(logging.LevelInfo, fmt.Sprintf("Service type %q treats readiness as simple; notification ignored.", serviceType))
-		}
-		if serviceType == "notify" || serviceType == "notify-reload" {
-			u.logNotifyFallback()
-			return "simple"
-		}
-		return serviceType
-	case "":
-		return "simple"
-	default:
-		u.Log(logging.LevelError, fmt.Sprintf("Unsupported service type %q; treating as simple.", serviceType))
-		return "simple"
-	}
-}
 
-func (u *Unit) logNotifyFallback() {
-	u.mu.Lock()
-	if u.notifyFallback {
-		u.mu.Unlock()
-		return
+	switch serviceType {
+	case "", "simple":
+		return "simple"
+
+	case "forking", "oneshot", "idle", "exec":
+		return serviceType
+
+	case "notify", "notify-reload":
+		return "notify"
+
+	case "dbus":
+		u.Log(logging.LevelInfo, "DBus type treated as simple")
+		return "simple"
+
+	default:
+		u.Log(logging.LevelError, fmt.Sprintf("Unsupported service type %q; treating as simple", serviceType))
+		return "simple"
 	}
-	u.notifyFallback = true
-	u.mu.Unlock()
-	u.Log(logging.LevelInfo, "Service type notify not supported; treating as simple")
 }
 
 func (u *Unit) transitionState(next State, reason string) {
@@ -762,6 +868,28 @@ func (u *Unit) killModeProcess() bool {
 	return strings.EqualFold(strings.TrimSpace(u.Config.Service.KillMode), "process")
 }
 
+func (u *Unit) killMainProcess(sig syscall.Signal) {
+	u.mu.Lock()
+	cmd := u.Cmd
+	killProcessGroup := !u.killModeProcess()
+	u.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	pid := cmd.Process.Pid
+
+	if killProcessGroup {
+		// Kill entire process group
+		_ = syscall.Kill(-pid, sig)
+	} else {
+		// Kill only main process
+		_ = syscall.Kill(pid, sig)
+	}
+}
+
+
 func (u *Unit) isCurrentToken(token int) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -797,5 +925,84 @@ func waitStatusError(status syscall.WaitStatus) error {
 		return fmt.Errorf("terminated by signal %s", status.Signal())
 	default:
 		return fmt.Errorf("process exited")
+	}
+}
+
+func (u *Unit) waitNotify(token int, ignoreFailure bool) {
+	u.mu.Lock()
+	server := u.notifyServer
+	cmd := u.Cmd
+	u.mu.Unlock()
+
+	if server == nil {
+		u.markFailed(fmt.Errorf("notify server missing"), ignoreFailure)
+		return
+	}
+
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+
+	select {
+
+	case <-server.Ready:
+		u.mu.Lock()
+		if u.startToken == token {
+			u.Runtime.State = StateActive
+			if cmd != nil && cmd.Process != nil {
+				u.Runtime.MainPID = cmd.Process.Pid
+			}
+		}
+		u.mu.Unlock()
+
+		server.Stop()
+
+		if u.reaper == nil {
+			go u.waitSimple(token, ignoreFailure)
+		}
+
+		return
+
+
+	case <-timer.C:
+		// Timeout waiting for READY=1
+
+		u.mu.Lock()
+		if u.startToken != token {
+			u.mu.Unlock()
+			return
+		}
+		cmd = u.Cmd
+		u.mu.Unlock()
+
+		// If process is still alive, fallback to simple behavior
+		if cmd != nil && cmd.Process != nil && processAlive(cmd.Process.Pid) {
+			u.mu.Lock()
+			u.Runtime.State = StateActive
+			u.Runtime.MainPID = cmd.Process.Pid
+			u.mu.Unlock()
+
+			server.Stop()
+			return
+		}
+
+		// Otherwise terminate service
+		u.killMainProcess(syscall.SIGTERM)
+
+		// Avoid zombie if no reaper
+		if u.reaper == nil && cmd != nil {
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				u.killMainProcess(syscall.SIGKILL)
+				<-done
+			}
+		}
+
+		server.Stop()
+		u.markFailed(fmt.Errorf("notify timeout"), ignoreFailure)
+		return
 	}
 }

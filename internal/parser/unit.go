@@ -10,15 +10,18 @@ import (
 
 type Unit struct {
 	Name                string
+	Type                string 
 	Description         string
 	After               []string
 	Requires            []string
 	Wants               []string
 	ConditionPathExists []string
 	Service             ServiceSection
+	Socket              SocketSection
 	Install             InstallSection
 	Ignored             map[string]string
 }
+
 
 type ServiceSection struct {
 	Type                     string
@@ -35,6 +38,12 @@ type ServiceSection struct {
 	KillMode                 string
 	Environment              []string
 	EnvironmentFile          []string
+}
+
+type SocketSection struct {
+	ListenStream   []string
+	ListenDatagram []string
+	SocketMode     string
 }
 
 type InstallSection struct {
@@ -61,6 +70,16 @@ func ParseUnit(path string) (*Unit, error) {
 		Name:    filepath.Base(path),
 		Ignored: map[string]string{},
 	}
+
+	switch {
+	case strings.HasSuffix(unit.Name, ".socket"):
+		unit.Type = "socket"
+	case strings.HasSuffix(unit.Name, ".service"):
+		unit.Type = "service"
+	default:
+		unit.Type = "unknown"
+	}
+
 
 	scanner := bufio.NewScanner(file)
 	section := ""
@@ -131,6 +150,16 @@ func ParseUnit(path string) (*Unit, error) {
 			case "EnvironmentFile":
 				unit.Service.EnvironmentFile = append(unit.Service.EnvironmentFile, value)
 			}
+		case "Socket":
+			switch key {
+			case "ListenStream":
+				unit.Socket.ListenStream = append(unit.Socket.ListenStream, value)
+			case "ListenDatagram":
+				unit.Socket.ListenDatagram = append(unit.Socket.ListenDatagram, value)
+			case "SocketMode":
+				unit.Socket.SocketMode = value
+			}
+
 		case "Install":
 			switch key {
 			case "WantedBy":
@@ -142,6 +171,13 @@ func ParseUnit(path string) (*Unit, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+	
+	if unit.Type == "socket" {
+		if len(unit.Socket.ListenStream) == 0 && len(unit.Socket.ListenDatagram) == 0 {
+			return nil, fmt.Errorf("socket unit missing ListenStream/ListenDatagram")
+		}
+	}
+
 
 	return unit, nil
 }
