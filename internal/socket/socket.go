@@ -24,22 +24,26 @@ type Runtime struct {
 func Start(unit *parser.Unit) (*Runtime, error) {
 	cfg := unit
 
-	if cfg.Socket.ListenStream == "" && cfg.Socket.ListenDatagram == "" {
+	if len(cfg.Socket.ListenStream) == 0 && len(cfg.Socket.ListenDatagram) == 0 {
 		return nil, fmt.Errorf("socket unit has no ListenStream or ListenDatagram")
 	}
 
 	r := &Runtime{}
 
-	if cfg.Socket.ListenStream != "" {
-		if err := r.startStream(cfg.Socket.ListenStream, cfg.Socket.SocketMode); err != nil {
-			return nil, err
+	if len(cfg.Socket.ListenStream) > 0 {
+		for _, path := range cfg.Socket.ListenStream {
+			if err := r.startStream(path, cfg.Socket.SocketMode); err != nil {
+				return nil, err
+			}
 		}
 		return r, nil
 	}
 
-	if cfg.Socket.ListenDatagram != "" {
-		if err := r.startDatagram(cfg.Socket.ListenDatagram, cfg.Socket.SocketMode); err != nil {
-			return nil, err
+	if len(cfg.Socket.ListenDatagram) > 0 {
+		for _, path := range cfg.Socket.ListenDatagram {
+			if err := r.startDatagram(path, cfg.Socket.SocketMode); err != nil {
+				return nil, err
+			}
 		}
 		return r, nil
 	}

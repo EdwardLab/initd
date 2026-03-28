@@ -87,6 +87,11 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			return Response{Success: false, Message: err.Error()}
 		}
 		return Response{Success: true}
+	case "reload":
+		if err := manager.ReloadUnit(req.Unit); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
 	case "stop":
 		if err := manager.StopUnit(req.Unit); err != nil {
 			return Response{Success: false, Message: err.Error()}
@@ -169,6 +174,8 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			return Response{Success: true, Data: "enabled"}
 		}
 		return Response{Success: true, Data: "disabled"}
+	case "is-system-running":
+		return Response{Success: true, Data: manager.SystemState()}
 	case "daemon-reload":
 		if err := manager.Reload(); err != nil {
 			return Response{Success: false, Message: err.Error()}

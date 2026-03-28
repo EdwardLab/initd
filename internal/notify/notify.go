@@ -1,11 +1,14 @@
 package notify
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Server struct {
@@ -17,8 +20,19 @@ type Server struct {
 }
 
 func Start() (*Server, error) {
-	path := "/run/initd/notify.sock"
+	name := "initd-notify-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	abstractAddr := &net.UnixAddr{Name: "\x00" + name, Net: "unixgram"}
+	if conn, err := net.ListenUnixgram("unixgram", abstractAddr); err == nil {
+		s := &Server{
+			Path:  "@" + name,
+			Conn:  conn,
+			Ready: make(chan struct{}),
+		}
+		go s.listen()
+		return s, nil
+	}
 
+	path := filepath.Join("/run/initd", fmt.Sprintf("notify-%d.sock", time.Now().UnixNano()))
 	_ = os.Remove(path)
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 
@@ -57,7 +71,7 @@ func (s *Server) Stop() {
 	if s.Conn != nil {
 		_ = s.Conn.Close()
 	}
-	if s.Path != "" {
+	if s.Path != "" && !strings.HasPrefix(s.Path, "@") {
 		_ = os.Remove(s.Path)
 	}
 }

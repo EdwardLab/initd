@@ -13,6 +13,7 @@ import (
 	"initd/internal/logging"
 	"initd/internal/parser"
 	"initd/internal/service"
+	"initd/internal/tmpfiles"
 )
 
 type Manager struct {
@@ -22,6 +23,8 @@ type Manager struct {
 	SearchPaths []string
 	UnitOrder   []string
 	reaper      service.ExitReaper
+	bootStarted bool
+	bootDone    bool
 }
 
 func NewManager() *Manager {
@@ -45,6 +48,10 @@ func (m *Manager) SetReaper(reaper service.ExitReaper) {
 }
 
 func (m *Manager) LoadUnits() error {
+	if err := tmpfiles.ApplyRuntimeDirs(); err != nil {
+		logKernelWarning(fmt.Sprintf("tmpfiles setup failed: %v", err))
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -138,6 +145,18 @@ func (m *Manager) StartEnabledUnits() error {
 	if err != nil {
 		return err
 	}
+
+	m.mu.Lock()
+	m.bootStarted = true
+	m.bootDone = false
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		m.bootDone = true
+		m.mu.Unlock()
+	}()
+
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
 
@@ -252,7 +271,7 @@ func (m *Manager) StopAllUnits() {
 		}
 
 		unit.Log(logging.LevelInfo, "Stopping for system shutdown")
-		_ = unit.Stop(10 * time.Second)
+		_ = unit.Stop(unit.StopTimeout())
 	}
 }
 
@@ -262,7 +281,7 @@ func (m *Manager) StopUnit(name string) error {
 	if err != nil {
 		return err
 	}
-	return unit.Stop(10 * time.Second)
+	return unit.Stop(unit.StopTimeout())
 }
 
 func (m *Manager) RestartUnit(name string) error {
@@ -270,7 +289,15 @@ func (m *Manager) RestartUnit(name string) error {
 	if err != nil {
 		return err
 	}
-	return unit.Restart(10 * time.Second)
+	return unit.Restart(unit.StopTimeout())
+}
+
+func (m *Manager) ReloadUnit(name string) error {
+	unit, err := m.FindUnit(name)
+	if err != nil {
+		return err
+	}
+	return unit.Reload()
 }
 
 func (m *Manager) ListUnits() []*service.Unit {
@@ -282,6 +309,31 @@ func (m *Manager) ListUnits() []*service.Unit {
 		units = append(units, unit)
 	}
 	return units
+}
+
+func (m *Manager) SystemState() string {
+	units := m.ListUnits()
+	hasFailed := false
+
+	for _, unit := range units {
+		if unit.Snapshot().State == service.StateFailed {
+			hasFailed = true
+		}
+	}
+
+	m.mu.Lock()
+	bootStarted := m.bootStarted
+	bootDone := m.bootDone
+	m.mu.Unlock()
+
+	switch {
+	case bootStarted && !bootDone:
+		return "starting"
+	case hasFailed:
+		return "degraded"
+	default:
+		return "running"
+	}
 }
 
 func (m *Manager) Reload() error {

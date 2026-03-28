@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -56,6 +57,17 @@ type Unit struct {
 
 type ExitReaper interface {
 	Register(pid int, handler func(syscall.WaitStatus))
+}
+
+type credentialSpec struct {
+	uid uint32
+	gid uint32
+	groups []uint32
+	set bool
+}
+
+type commandOptions struct {
+	rootOnly bool
 }
 
 func NewUnit(config *parser.Unit, path string) *Unit {
@@ -111,6 +123,14 @@ func (u *Unit) Start() (int, error) {
 		return token, err
 	}
 
+	if status, err := u.runExecCondition(); err != nil {
+		u.markFailed(err, false)
+		return token, err
+	} else if status == "skip" {
+		u.transitionState(StateInactive, "")
+		return token, nil
+	}
+
 	execStart := strings.TrimSpace(u.Config.Service.ExecStart)
 	if execStart == "" {
 		err := errors.New("ExecStart is empty")
@@ -118,7 +138,7 @@ func (u *Unit) Start() (int, error) {
 		return token, err
 	}
 
-	if err := u.ensureRuntimeDirectory(); err != nil {
+	if err := u.ensureManagedDirectories(); err != nil {
 		u.markFailed(err, false)
 		return token, err
 	}
@@ -167,9 +187,11 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 	serviceType := u.canonicalServiceType()
 
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Dir = filepath.Dir(u.Path)
+	cmd, err := u.buildExecCommand(args, commandOptions{})
+	if err != nil {
+		u.markFailed(err, ignoreFailure)
+		return
+	}
 
 	// -------------------------------------------------
 	// Proper notify socket creation
@@ -188,8 +210,6 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		u.mu.Unlock()
 	}
 
-	cmd.Env = envList
-
 	stdoutLogger := &logging.LineLogger{
 		Unit:   u.Config.Name,
 		PID:    0,
@@ -205,8 +225,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		Output: os.Stderr,
 	}
 
-	cmd.Stdout = stdoutLogger
-	cmd.Stderr = stderrLogger
+	u.configureCommand(cmd, envList, stdoutLogger, stderrLogger)
 
 	if err := cmd.Start(); err != nil {
 		u.markFailed(err, ignoreFailure)
@@ -246,11 +265,20 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// Register reaper first (avoid race)
 	// -------------------------------------------------
 	if u.reaper != nil {
-		resetActive := serviceType == "simple"
+		resetActive := serviceType == "simple" || serviceType == "notify"
 		pid := cmd.Process.Pid
 
 		u.reaper.Register(pid, func(status syscall.WaitStatus) {
-			u.handleExitStatus(token, status, ignoreFailure, resetActive)
+			if serviceType == "oneshot" {
+				exitCode := commandExitStatus(status)
+				if exitCode == 0 {
+					if err := u.runExecStartPost(token, envMap, envList); err != nil {
+						u.markFailed(err, ignoreFailure)
+						return
+					}
+				}
+			}
+			u.handleExitStatusForPID(token, pid, status, ignoreFailure, resetActive)
 		})
 	}
 
@@ -259,18 +287,23 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// -------------------------------------------------
 	switch serviceType {
 	case "oneshot":
-		go u.waitOneshot(token, ignoreFailure)
+		go u.waitOneshot(token, envMap, envList, ignoreFailure)
 	case "forking":
-		go u.waitForking(token, ignoreFailure)
+		go u.waitForking(token, envMap, envList, ignoreFailure)
 	case "notify":
-		go u.waitNotify(token, ignoreFailure)
+		go u.waitNotify(token, envMap, envList, ignoreFailure)
 	default:
-		go u.waitSimple(token, ignoreFailure)
+		go u.waitSimple(token, envMap, envList, ignoreFailure)
 	}
 }
 
 
-func (u *Unit) waitSimple(token int, ignoreFailure bool) {
+func (u *Unit) waitSimple(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
+	if err := u.runExecStartPost(token, envMap, envList); err != nil {
+		u.killMainProcess(syscall.SIGTERM)
+		u.markFailed(err, ignoreFailure)
+		return
+	}
 	if u.reaper != nil {
 		return
 	}
@@ -278,18 +311,26 @@ func (u *Unit) waitSimple(token int, ignoreFailure bool) {
 	u.handleExit(token, err, ignoreFailure, true)
 }
 
-func (u *Unit) waitOneshot(token int, ignoreFailure bool) {
+func (u *Unit) waitOneshot(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
 	if u.reaper != nil {
 		return
 	}
 	err := u.Cmd.Wait()
-	u.handleExit(token, err, ignoreFailure, false)
+	if err != nil {
+		u.handleExit(token, err, ignoreFailure, false)
+		return
+	}
+	if err := u.runExecStartPost(token, envMap, envList); err != nil {
+		u.markFailed(err, ignoreFailure)
+		return
+	}
+	u.handleExit(token, nil, ignoreFailure, false)
 }
 
-func (u *Unit) waitForking(token int, ignoreFailure bool) {
+func (u *Unit) waitForking(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
 	startedAt := time.Now()
 	startedAtMonotonic := logging.MonotonicNow()
-	timeout := 2 * time.Second
+	timeout := u.StartTimeout()
 	poll := 100 * time.Millisecond
 
 	// systemd waits for the PIDFile to appear for Type=forking; without cgroups
@@ -311,6 +352,13 @@ func (u *Unit) waitForking(token int, ignoreFailure bool) {
 	u.Runtime.StartedAt = startedAt
 	u.Runtime.StartedAtMonotonic = startedAtMonotonic
 	u.mu.Unlock()
+	if err := u.runExecStartPost(token, envMap, envList); err != nil {
+		if pid != 0 {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+		u.markFailed(err, ignoreFailure)
+		return
+	}
 	if u.reaper != nil {
 		return
 	}
@@ -327,6 +375,7 @@ func (u *Unit) waitForking(token int, ignoreFailure bool) {
 }
 
 func (u *Unit) Stop(timeout time.Duration) error {
+	runStopPost := true
 	defer func() {
 		u.mu.Lock()
 		if u.notifyServer != nil {
@@ -334,6 +383,9 @@ func (u *Unit) Stop(timeout time.Duration) error {
 			u.notifyServer = nil
 		}
 		u.mu.Unlock()
+		if runStopPost {
+			_ = u.runExecStopPost()
+		}
 	}()
 
 	stopCommand := strings.TrimSpace(u.Config.Service.ExecStop)
@@ -348,6 +400,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 
 	u.mu.Lock()
 	if u.Runtime.State == StateInactive {
+		runStopPost = false
 		u.mu.Unlock()
 		return nil
 	}
@@ -371,14 +424,16 @@ func (u *Unit) Stop(timeout time.Duration) error {
 				done <- cmd.Wait()
 			}()
 
-			select {
-			case <-done:
-				// Clean exit
-			case <-time.After(timeout):
-				// Escalate
-				if pid != 0 {
-					_ = syscall.Kill(pid, syscall.SIGKILL)
+			if timeout > 0 {
+				select {
+				case <-done:
+				case <-time.After(timeout):
+					if pid != 0 {
+						_ = syscall.Kill(pid, syscall.SIGKILL)
+					}
+					<-done
 				}
+			} else {
 				<-done
 			}
 		}
@@ -410,21 +465,35 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		}
 	}
 
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
+	waitUntilStopped := func() bool {
 		if serviceType == "forking" {
 			if pid == 0 || !processAlive(pid) {
 				u.transitionState(StateInactive, "")
-				return nil
+				return true
 			}
 		} else {
 			state := u.Snapshot().State
 			if state == StateInactive || state == StateFailed {
-				return nil
+				return true
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
+		return false
+	}
+
+	if timeout <= 0 {
+		for {
+			if waitUntilStopped() {
+				return nil
+			}
+		}
+	}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if waitUntilStopped() {
+			return nil
+		}
 	}
 
 	// Timeout escalation
@@ -455,13 +524,39 @@ func (u *Unit) Restart(timeout time.Duration) error {
 	return err
 }
 
+func (u *Unit) Reload() error {
+	u.mu.Lock()
+	active := u.Runtime.State == StateActive
+	u.mu.Unlock()
+	if !active {
+		return errors.New("unit is not active")
+	}
+	if len(u.Config.Service.ExecReload) == 0 {
+		return errors.New("ExecReload not set")
+	}
+
+	envMap, envList, err := u.buildEnvironment()
+	if err != nil {
+		return err
+	}
+	for _, command := range u.Config.Service.ExecReload {
+		if strings.TrimSpace(command) == "" {
+			continue
+		}
+		if err := u.runCommand(command, envMap, envList, commandOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (u *Unit) runStopCommand(command string) error {
 	envMap, envList, err := u.buildEnvironment()
 	if err != nil {
 		return err
 	}
 
-	return u.runCommand(command, envMap, envList)
+	return u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly})
 }
 
 func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
@@ -574,10 +669,14 @@ func (u *Unit) handleExit(token int, err error, ignoreFailure bool, resetActive 
 			}
 		}
 	}
-	u.handleExitCode(token, exitCode, err, ignoreFailure, resetActive)
+	u.handleExitCode(token, 0, exitCode, err, ignoreFailure, resetActive)
 }
 
 func (u *Unit) handleExitStatus(token int, status syscall.WaitStatus, ignoreFailure bool, resetActive bool) {
+	u.handleExitStatusForPID(token, 0, status, ignoreFailure, resetActive)
+}
+
+func (u *Unit) handleExitStatusForPID(token int, watchedPID int, status syscall.WaitStatus, ignoreFailure bool, resetActive bool) {
 	exitCode := 0
 	var err error
 	switch {
@@ -593,10 +692,33 @@ func (u *Unit) handleExitStatus(token int, status syscall.WaitStatus, ignoreFail
 		err = fmt.Errorf("process exited")
 		exitCode = 1
 	}
-	u.handleExitCode(token, exitCode, err, ignoreFailure, resetActive)
+	u.handleExitCode(token, watchedPID, exitCode, err, ignoreFailure, resetActive)
 }
 
-func (u *Unit) handleExitCode(token int, exitCode int, err error, ignoreFailure bool, resetActive bool) {
+func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error, ignoreFailure bool, resetActive bool) {
+	serviceType := u.canonicalServiceType()
+	if serviceType == "notify" && watchedPID != 0 {
+		adoptTimeout := u.StartTimeout()
+		if adoptTimeout <= 0 {
+			adoptTimeout = 30 * time.Second
+		}
+		if adoptedPID := u.waitForNotifyMainPID(watchedPID, adoptTimeout, 50*time.Millisecond); adoptedPID != 0 && adoptedPID != watchedPID {
+			u.mu.Lock()
+			if u.startToken == token {
+				if u.notifyServer != nil {
+					u.notifyServer.Stop()
+					u.notifyServer = nil
+				}
+				u.Runtime.State = StateActive
+				u.Runtime.MainPID = adoptedPID
+				u.Runtime.ExitCode = 0
+				u.Runtime.LastError = ""
+			}
+			u.mu.Unlock()
+			return
+		}
+	}
+
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -604,10 +726,40 @@ func (u *Unit) handleExitCode(token int, exitCode int, err error, ignoreFailure 
 		return
 	}
 
+	if serviceType == "notify" && watchedPID != 0 {
+		if adoptedPID := u.adoptedNotifyPIDWithCurrent(watchedPID, u.Runtime.MainPID); adoptedPID != 0 && adoptedPID != watchedPID {
+			if u.notifyServer != nil {
+				u.notifyServer.Stop()
+				u.notifyServer = nil
+			}
+			u.Runtime.State = StateActive
+			u.Runtime.MainPID = adoptedPID
+			u.Runtime.ExitCode = 0
+			u.Runtime.LastError = ""
+			return
+		}
+		if currentPID := u.Runtime.MainPID; currentPID != 0 && currentPID != watchedPID && processAlive(currentPID) {
+			if u.notifyServer != nil {
+				u.notifyServer.Stop()
+				u.notifyServer = nil
+			}
+			u.Runtime.State = StateActive
+			u.Runtime.ExitCode = 0
+			u.Runtime.LastError = ""
+			return
+		}
+	}
+
 	// Respect RestartPreventExitStatus
 	if prevent := u.RestartPreventExitStatus(); prevent != nil {
 		if _, blocked := prevent[exitCode]; blocked {
 			return
+		}
+	}
+	if success := u.SuccessExitStatus(); success != nil {
+		if _, ok := success[exitCode]; ok {
+			err = nil
+			exitCode = 0
 		}
 	}
 
@@ -676,6 +828,13 @@ func (u *Unit) RecordRestart(now time.Time, interval time.Duration) int {
 }
 
 func (u *Unit) MarkFailed(reason string) {
+	u.mu.Lock()
+	current := u.Runtime.LastError
+	u.mu.Unlock()
+	if current != "" && current != reason {
+		u.transitionState(StateFailed, reason+": "+current)
+		return
+	}
 	u.transitionState(StateFailed, reason)
 }
 
@@ -758,23 +917,59 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 }
 
 func (u *Unit) ensureRuntimeDirectory() error {
-	runtimeDir := strings.TrimSpace(u.Config.Service.RuntimeDirectory)
-	if runtimeDir == "" {
+	return u.ensureNamedDirectories("/run", u.Config.Service.RuntimeDirectory, u.Config.Service.RuntimeDirectoryMode)
+}
+
+func (u *Unit) ensureManagedDirectories() error {
+	if err := u.ensureRuntimeDirectory(); err != nil {
+		return err
+	}
+	if err := u.ensureNamedDirectories("/var/lib", u.Config.Service.StateDirectory, "0755"); err != nil {
+		return err
+	}
+	if err := u.ensureNamedDirectories("/var/cache", u.Config.Service.CacheDirectory, "0755"); err != nil {
+		return err
+	}
+	if err := u.ensureNamedDirectories("/var/log", u.Config.Service.LogsDirectory, "0755"); err != nil {
+		return err
+	}
+	if err := u.ensureNamedDirectories("/etc", u.Config.Service.ConfigurationDirectory, "0755"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (u *Unit) ensureNamedDirectories(base string, names []string, modeStr string) error {
+	if len(names) == 0 {
 		return nil
 	}
-	mode := os.FileMode(0o755)
-	if modeStr := strings.TrimSpace(u.Config.Service.RuntimeDirectoryMode); modeStr != "" {
-		parsed, err := strconv.ParseUint(modeStr, 8, 32)
-		if err != nil {
-			return fmt.Errorf("RuntimeDirectoryMode parse: %w", err)
+	mode, err := parseFileMode(modeStr, 0o755)
+	if err != nil {
+		return err
+	}
+	creds, err := u.resolveCredentialsForStart(false)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
 		}
-		mode = os.FileMode(parsed)
+		path := filepath.Join(base, name)
+		if err := os.MkdirAll(path, mode); err != nil {
+			return fmt.Errorf("create directory %s: %w", path, err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			return err
+		}
+		if creds.set {
+			if err := os.Chown(path, int(creds.uid), int(creds.gid)); err != nil {
+				return fmt.Errorf("chown directory %s: %w", path, err)
+			}
+		}
 	}
-	path := filepath.Join("/run", runtimeDir)
-	if err := os.MkdirAll(path, mode); err != nil {
-		return fmt.Errorf("RuntimeDirectory create: %w", err)
-	}
-	return os.Chmod(path, mode)
+	return nil
 }
 
 func (u *Unit) runExecStartPre(token int, envMap map[string]string, envList []string) error {
@@ -785,39 +980,118 @@ func (u *Unit) runExecStartPre(token int, envMap map[string]string, envList []st
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (u *Unit) runCommand(command string, envMap map[string]string, envList []string) error {
+func (u *Unit) runExecCondition() (string, error) {
+	if len(u.Config.Service.ExecCondition) == 0 {
+		return "continue", nil
+	}
+	envMap, envList, err := u.buildEnvironment()
+	if err != nil {
+		return "", err
+	}
+	for _, command := range u.Config.Service.ExecCondition {
+		if strings.TrimSpace(command) == "" {
+			continue
+		}
+		status, err := u.runCommandStatus(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly})
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case status == 0:
+			continue
+		case status >= 1 && status <= 254:
+			return "skip", nil
+		default:
+			return "", fmt.Errorf("ExecCondition failed with status %d", status)
+		}
+	}
+	return "continue", nil
+}
+
+func (u *Unit) runExecStartPost(token int, envMap map[string]string, envList []string) error {
+	for _, command := range u.Config.Service.ExecStartPost {
+		if !u.isCurrentToken(token) {
+			return nil
+		}
+		if strings.TrimSpace(command) == "" {
+			continue
+		}
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (u *Unit) runExecStopPost() error {
+	envMap, envList, err := u.buildEnvironment()
+	if err != nil {
+		return err
+	}
+	for _, command := range u.Config.Service.ExecStopPost {
+		if strings.TrimSpace(command) == "" {
+			continue
+		}
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (u *Unit) runCommand(command string, envMap map[string]string, envList []string, opts commandOptions) error {
+	status, err := u.runCommandStatus(command, envMap, envList, opts)
+	command, ignoreFailure := stripPrefix(command)
+	if err != nil {
+		if ignoreFailure {
+			return nil
+		}
+		return err
+	}
+	if status != 0 {
+		if ignoreFailure {
+			return nil
+		}
+		return fmt.Errorf("exit status %d", status)
+	}
+	return nil
+}
+
+func (u *Unit) runCommandStatus(command string, envMap map[string]string, envList []string, opts commandOptions) (int, error) {
 	command, ignoreFailure := stripPrefix(command)
 	expanded := expandWithEnv(command, envMap)
 	args, err := shlex.Split(expanded)
 	if err != nil {
 		if ignoreFailure {
-			return nil
+			return 0, nil
 		}
-		return fmt.Errorf("parse command: %w", err)
+		return 0, fmt.Errorf("parse command: %w", err)
 	}
 	if len(args) == 0 {
-		return nil
+		return 0, nil
 	}
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Env = envList
-	cmd.Dir = filepath.Dir(u.Path)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd, err := u.buildExecCommand(args, opts)
+	if err != nil {
+		if ignoreFailure {
+			return 0, nil
+		}
+		return 0, err
+	}
 	stdoutLogger := &logging.LineLogger{Unit: u.Config.Name, PID: 0, Level: logging.LevelInfo, Buffer: u.Logs, Output: os.Stdout}
 	stderrLogger := &logging.LineLogger{Unit: u.Config.Name, PID: 0, Level: logging.LevelError, Buffer: u.Logs, Output: os.Stderr}
-	cmd.Stdout = stdoutLogger
-	cmd.Stderr = stderrLogger
+	u.configureCommand(cmd, envList, stdoutLogger, stderrLogger)
 	if err := cmd.Start(); err != nil {
 		if ignoreFailure {
-			return nil
+			return 0, nil
 		}
-		return err
+		return 0, err
 	}
 	stdoutLogger.PID = cmd.Process.Pid
 	stderrLogger.PID = cmd.Process.Pid
@@ -827,21 +1101,67 @@ func (u *Unit) runCommand(command string, envMap map[string]string, envList []st
 			done <- status
 		})
 		status := <-done
-		if err := waitStatusError(status); err != nil {
-			if ignoreFailure {
-				return nil
-			}
-			return err
-		}
-		return nil
+		return commandExitStatus(status), nil
 	}
 	if err := cmd.Wait(); err != nil {
-		if ignoreFailure {
-			return nil
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				return commandExitStatus(status), nil
+			}
 		}
-		return err
+		if ignoreFailure {
+			return 0, nil
+		}
+		return 0, err
 	}
-	return nil
+	return 0, nil
+}
+
+func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, error) {
+	if len(args) == 0 {
+		return nil, errors.New("command parsed to empty")
+	}
+	umask := strings.TrimSpace(u.Config.Service.UMask)
+	limitNOFILE := strings.TrimSpace(u.Config.Service.LimitNOFILE)
+	var cmd *exec.Cmd
+	if umask != "" || limitNOFILE != "" {
+		setup := make([]string, 0, 2)
+		if umask != "" {
+			setup = append(setup, fmt.Sprintf("umask %s", umask))
+		}
+		if limitNOFILE != "" {
+			setup = append(setup, fmt.Sprintf("ulimit -n %s >/dev/null 2>&1 || true", limitNOFILE))
+		}
+		setup = append(setup, `exec "$@"`)
+		shellArgs := []string{"-c", strings.Join(setup, "; "), "_"}
+		shellArgs = append(shellArgs, args...)
+		cmd = exec.Command("/bin/sh", shellArgs...)
+	} else {
+		cmd = exec.Command(args[0], args[1:]...)
+	}
+
+	creds, err := u.resolveCredentialsForStart(opts.rootOnly)
+	if err != nil {
+		return nil, err
+	}
+	sysProcAttr := &syscall.SysProcAttr{Setpgid: true}
+	if creds.set {
+		sysProcAttr.Credential = &syscall.Credential{Uid: creds.uid, Gid: creds.gid, Groups: creds.groups}
+	}
+	if rootDir := strings.TrimSpace(u.Config.Service.RootDirectory); rootDir != "" {
+		sysProcAttr.Chroot = rootDir
+	}
+	cmd.SysProcAttr = sysProcAttr
+	cmd.Dir = u.workingDirectory()
+	return cmd, nil
+}
+
+func (u *Unit) configureCommand(cmd *exec.Cmd, envList []string, stdoutLogger, stderrLogger *logging.LineLogger) {
+	cmd.Env = mergeEnvList(envList, map[string]string{
+		"MAINPID": strconv.Itoa(u.mainPID()),
+	})
+	cmd.Stdout = stdoutLogger
+	cmd.Stderr = stderrLogger
 }
 
 func (u *Unit) checkConditions() error {
@@ -889,6 +1209,11 @@ func (u *Unit) killMainProcess(sig syscall.Signal) {
 	}
 }
 
+func (u *Unit) mainPID() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.Runtime.MainPID
+}
 
 func (u *Unit) isCurrentToken(token int) bool {
 	u.mu.Lock()
@@ -901,17 +1226,23 @@ func (u *Unit) IsCurrentToken(token int) bool {
 }
 
 func (u *Unit) RestartPreventExitStatus() map[int]struct{} {
-	raw := strings.Fields(u.Config.Service.RestartPreventExitStatus)
-	if len(raw) == 0 {
-		return nil
+	return parseExitStatusSet(u.Config.Service.RestartPreventExitStatus)
+}
+
+func (u *Unit) StopTimeout() time.Duration {
+	raw := strings.TrimSpace(u.Config.Service.TimeoutStopSec)
+	if raw == "" {
+		raw = strings.TrimSpace(u.Config.Service.TimeoutSec)
 	}
-	result := make(map[int]struct{}, len(raw))
-	for _, entry := range raw {
-		if value, err := strconv.Atoi(entry); err == nil {
-			result[value] = struct{}{}
-		}
+	return parseSystemdDuration(raw, 10*time.Second)
+}
+
+func (u *Unit) StartTimeout() time.Duration {
+	raw := strings.TrimSpace(u.Config.Service.TimeoutStartSec)
+	if raw == "" {
+		raw = strings.TrimSpace(u.Config.Service.TimeoutSec)
 	}
-	return result
+	return parseSystemdDuration(raw, 30*time.Second)
 }
 
 func waitStatusError(status syscall.WaitStatus) error {
@@ -928,7 +1259,112 @@ func waitStatusError(status syscall.WaitStatus) error {
 	}
 }
 
-func (u *Unit) waitNotify(token int, ignoreFailure bool) {
+func commandExitStatus(status syscall.WaitStatus) int {
+	switch {
+	case status.Exited():
+		return status.ExitStatus()
+	case status.Signaled():
+		return 128 + int(status.Signal())
+	default:
+		return 1
+	}
+}
+
+func (u *Unit) livePIDFilePID() int {
+	pid, err := u.readPIDFile()
+	if err != nil || pid <= 0 || !processAlive(pid) {
+		return 0
+	}
+	return pid
+}
+
+func (u *Unit) waitForLivePIDFile(timeout time.Duration, poll time.Duration) int {
+	if strings.TrimSpace(u.Config.Service.PIDFile) == "" {
+		return 0
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if pid := u.livePIDFilePID(); pid != 0 {
+			return pid
+		}
+		if time.Now().After(deadline) {
+			return 0
+		}
+		time.Sleep(poll)
+	}
+}
+
+func (u *Unit) processGroupMemberPID(pgid int, exclude int) int {
+	if pgid <= 0 {
+		return 0
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 || pid == exclude {
+			continue
+		}
+		memberPGID, err := syscall.Getpgid(pid)
+		if err != nil || memberPGID != pgid || !processAlive(pid) {
+			continue
+		}
+		return pid
+	}
+	return 0
+}
+
+func (u *Unit) adoptedNotifyPIDWithCurrent(watchedPID int, currentPID int) int {
+	if pid := u.livePIDFilePID(); pid != 0 && pid != watchedPID {
+		return pid
+	}
+	if currentPID != 0 && currentPID != watchedPID && processAlive(currentPID) {
+		return currentPID
+	}
+	if memberPID := u.processGroupMemberPID(watchedPID, watchedPID); memberPID != 0 {
+		return memberPID
+	}
+	return 0
+}
+
+func (u *Unit) adoptedNotifyPID(watchedPID int) int {
+	return u.adoptedNotifyPIDWithCurrent(watchedPID, u.mainPID())
+}
+
+func (u *Unit) waitForNotifyMainPID(watchedPID int, timeout time.Duration, poll time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		if pid := u.adoptedNotifyPID(watchedPID); pid != 0 {
+			return pid
+		}
+		if time.Now().After(deadline) {
+			return 0
+		}
+		time.Sleep(poll)
+	}
+}
+
+func (u *Unit) notifyMainPID(cmd *exec.Cmd) int {
+	if pid := u.waitForLivePIDFile(500*time.Millisecond, 25*time.Millisecond); pid != 0 {
+		return pid
+	}
+	if cmd != nil && cmd.Process != nil {
+		if pid := u.processGroupMemberPID(cmd.Process.Pid, cmd.Process.Pid); pid != 0 {
+			return pid
+		}
+	}
+	if cmd != nil && cmd.Process != nil {
+		return cmd.Process.Pid
+	}
+	return 0
+}
+
+func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
 	u.mu.Lock()
 	server := u.notifyServer
 	cmd := u.Cmd
@@ -939,20 +1375,26 @@ func (u *Unit) waitNotify(token int, ignoreFailure bool) {
 		return
 	}
 
-	timer := time.NewTimer(30 * time.Second)
+	timer := time.NewTimer(u.StartTimeout())
 	defer timer.Stop()
 
 	select {
 
 	case <-server.Ready:
+		pid := u.notifyMainPID(cmd)
 		u.mu.Lock()
 		if u.startToken == token {
 			u.Runtime.State = StateActive
-			if cmd != nil && cmd.Process != nil {
-				u.Runtime.MainPID = cmd.Process.Pid
+			if pid != 0 {
+				u.Runtime.MainPID = pid
 			}
 		}
 		u.mu.Unlock()
+		if err := u.runExecStartPost(token, envMap, envList); err != nil {
+			u.killMainProcess(syscall.SIGTERM)
+			u.markFailed(err, ignoreFailure)
+			return
+		}
 
 		return
 
@@ -963,7 +1405,22 @@ func (u *Unit) waitNotify(token int, ignoreFailure bool) {
 			return
 		}
 		cmd = u.Cmd
+		pid := u.Runtime.MainPID
+		if pid == 0 {
+			pid = u.notifyMainPID(cmd)
+		}
 		u.mu.Unlock()
+
+		if pid != 0 && processAlive(pid) {
+			u.mu.Lock()
+			if u.startToken == token {
+				u.Runtime.State = StateActive
+				u.Runtime.MainPID = pid
+			}
+			u.mu.Unlock()
+			u.Log(logging.LevelInfo, "Type=notify readiness timed out; falling back to active because process is still running")
+			return
+		}
 
 		if cmd != nil && cmd.Process != nil {
 			u.killMainProcess(syscall.SIGTERM)
@@ -974,3 +1431,169 @@ func (u *Unit) waitNotify(token int, ignoreFailure bool) {
 	}
 }
 
+func mergeEnvList(envList []string, extra map[string]string) []string {
+	envMap := make(map[string]string, len(envList)+len(extra))
+	for _, pair := range envList {
+		if key, value, ok := strings.Cut(pair, "="); ok {
+			envMap[key] = value
+		}
+	}
+	for key, value := range extra {
+		if key == "" {
+			continue
+		}
+		envMap[key] = value
+	}
+	merged := make([]string, 0, len(envMap))
+	for key, value := range envMap {
+		merged = append(merged, fmt.Sprintf("%s=%s", key, value))
+	}
+	return merged
+}
+
+func (u *Unit) resolveCredentialsForStart(rootOnly bool) (credentialSpec, error) {
+	if rootOnly {
+		return credentialSpec{}, nil
+	}
+	userName := strings.TrimSpace(u.Config.Service.User)
+	groupName := strings.TrimSpace(u.Config.Service.Group)
+	if userName == "" && groupName == "" {
+		return credentialSpec{}, nil
+	}
+
+	var (
+		uid uint32
+		gid uint32
+		err error
+	)
+
+	if userName != "" {
+		uid, gid, err = lookupUser(userName)
+		if err != nil {
+			return credentialSpec{}, err
+		}
+	}
+
+	if groupName != "" {
+		gid, err = lookupGroup(groupName)
+		if err != nil {
+			return credentialSpec{}, err
+		}
+	} else if userName == "" {
+		gid = uint32(os.Getgid())
+	}
+
+	if userName == "" {
+		uid = uint32(os.Getuid())
+	}
+
+	groups, err := lookupSupplementaryGroups(u.Config.Service.SupplementaryGroups)
+	if err != nil {
+		return credentialSpec{}, err
+	}
+
+	return credentialSpec{uid: uid, gid: gid, groups: groups, set: true}, nil
+}
+
+func (u *Unit) workingDirectory() string {
+	if dir := strings.TrimSpace(u.Config.Service.WorkingDirectory); dir != "" {
+		return dir
+	}
+	return filepath.Dir(u.Path)
+}
+
+func (u *Unit) SuccessExitStatus() map[int]struct{} {
+	return parseExitStatusSet(u.Config.Service.SuccessExitStatus)
+}
+
+func lookupUser(name string) (uint32, uint32, error) {
+	if uid, err := strconv.ParseUint(name, 10, 32); err == nil {
+		return uint32(uid), uint32(os.Getgid()), nil
+	}
+	info, err := user.Lookup(name)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %q: %w", name, err)
+	}
+	uid, err := strconv.ParseUint(info.Uid, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse uid for %q: %w", name, err)
+	}
+	gid, err := strconv.ParseUint(info.Gid, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse gid for %q: %w", name, err)
+	}
+	return uint32(uid), uint32(gid), nil
+}
+
+func lookupGroup(name string) (uint32, error) {
+	if gid, err := strconv.ParseUint(name, 10, 32); err == nil {
+		return uint32(gid), nil
+	}
+	info, err := user.LookupGroup(name)
+	if err != nil {
+		return 0, fmt.Errorf("lookup group %q: %w", name, err)
+	}
+	gid, err := strconv.ParseUint(info.Gid, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("parse gid for %q: %w", name, err)
+	}
+	return uint32(gid), nil
+}
+
+func lookupSupplementaryGroups(entries []string) ([]uint32, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	groups := make([]uint32, 0, len(entries))
+	for _, entry := range entries {
+		gid, err := lookupGroup(entry)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, gid)
+	}
+	return groups, nil
+}
+
+func parseExitStatusSet(raw string) map[int]struct{} {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return nil
+	}
+	result := make(map[int]struct{}, len(fields))
+	for _, entry := range fields {
+		if value, err := strconv.Atoi(entry); err == nil {
+			result[value] = struct{}{}
+		}
+	}
+	return result
+}
+
+func parseSystemdDuration(raw string, defaultValue time.Duration) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultValue
+	}
+	if raw == "0" || strings.EqualFold(raw, "infinity") {
+		return 0
+	}
+	if parsed, err := time.ParseDuration(raw); err == nil {
+		return parsed
+	}
+	if seconds, err := time.ParseDuration(raw + "s"); err == nil {
+		return seconds
+	}
+	return defaultValue
+}
+
+func parseFileMode(raw string, defaultValue os.FileMode) (os.FileMode, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultValue, nil
+	}
+	parsed, err := strconv.ParseUint(raw, 8, 32)
+	if err != nil {
+		return 0, fmt.Errorf("parse file mode %q: %w", raw, err)
+	}
+	return os.FileMode(parsed), nil
+}

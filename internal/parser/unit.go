@@ -25,17 +25,36 @@ type Unit struct {
 
 type ServiceSection struct {
 	Type                     string
+	PermissionsStartOnly     bool
+	ExecCondition            []string
 	ExecStartPre             []string
+	ExecStartPost            []string
 	ExecStart                string
 	ExecStop                 string
+	ExecStopPost             []string
 	ExecReload               []string
 	Restart                  string
 	RestartSec               string
 	RestartPreventExitStatus string
+	SuccessExitStatus        string
 	PIDFile                  string
-	RuntimeDirectory         string
+	WorkingDirectory         string
+	RootDirectory            string
+	RuntimeDirectory         []string
 	RuntimeDirectoryMode     string
+	StateDirectory           []string
+	CacheDirectory           []string
+	LogsDirectory            []string
+	ConfigurationDirectory   []string
 	KillMode                 string
+	TimeoutStartSec          string
+	TimeoutStopSec           string
+	TimeoutSec               string
+	User                     string
+	Group                    string
+	SupplementaryGroups      []string
+	UMask                    string
+	LimitNOFILE              string
 	Environment              []string
 	EnvironmentFile          []string
 }
@@ -51,12 +70,68 @@ type InstallSection struct {
 }
 
 var ignoredKeys = map[string]struct{}{
-	"MemoryMax":   {},
-	"CPUQuota":    {},
-	"TasksMax":    {},
-	"IOWeight":    {},
-	"DeviceAllow": {},
-	"DeviceDeny":  {},
+	"MemoryMax":                {},
+	"CPUQuota":                 {},
+	"TasksMax":                 {},
+	"IOWeight":                 {},
+	"DeviceAllow":              {},
+	"DeviceDeny":               {},
+	"PrivateTmp":               {},
+	"ProtectSystem":            {},
+	"RestrictNamespaces":       {},
+	"CapabilityBoundingSet":    {},
+	"AmbientCapabilities":      {},
+	"SystemCallFilter":         {},
+	"SystemCallArchitectures":  {},
+	"ProtectProc":              {},
+	"ProcSubset":               {},
+	"NoExecPaths":              {},
+	"ExecPaths":                {},
+	"PrivateDevices":           {},
+	"ProtectHome":              {},
+	"ReadWritePaths":           {},
+	"ReadOnlyPaths":            {},
+	"InaccessiblePaths":        {},
+	"ReadWriteDirectories":     {},
+	"ReadOnlyDirectories":      {},
+	"InaccessibleDirectories":  {},
+	"NoNewPrivileges":          {},
+	"LockPersonality":          {},
+	"MemoryDenyWriteExecute":   {},
+	"PrivateUsers":             {},
+	"ProtectClock":             {},
+	"ProtectControlGroups":     {},
+	"ProtectHostname":          {},
+	"ProtectKernelLogs":        {},
+	"ProtectKernelModules":     {},
+	"ProtectKernelTunables":    {},
+	"RemoveIPC":                {},
+	"RestrictAddressFamilies":  {},
+	"RestrictRealtime":         {},
+	"RestrictSUIDSGID":         {},
+	"OOMScoreAdjust":           {},
+	"Nice":                     {},
+	"IOSchedulingClass":        {},
+	"IOSchedulingPriority":     {},
+	"CPUSchedulingPolicy":      {},
+	"CPUSchedulingPriority":    {},
+	"CPUAffinity":              {},
+	"LimitNPROC":               {},
+	"LimitCORE":                {},
+	"LimitMEMLOCK":             {},
+	"LimitAS":                  {},
+	"LimitRSS":                 {},
+	"LimitDATA":                {},
+	"LimitSTACK":               {},
+	"LimitCPU":                 {},
+	"Slice":                    {},
+	"Delegate":                 {},
+	"TasksAccounting":          {},
+	"MemoryAccounting":         {},
+	"CPUAccounting":            {},
+	"IOAccounting":             {},
+	"BlockIOAccounting":        {},
+	"DefaultDependencies":      {},
 }
 
 func ParseUnit(path string) (*Unit, error) {
@@ -118,17 +193,27 @@ func ParseUnit(path string) (*Unit, error) {
 				unit.Wants = splitList(value)
 			case "ConditionPathExists":
 				unit.ConditionPathExists = append(unit.ConditionPathExists, value)
+			default:
+				unit.Ignored["Unit."+key] = value
 			}
 		case "Service":
 			switch key {
 			case "Type":
 				unit.Service.Type = value
+			case "PermissionsStartOnly":
+				unit.Service.PermissionsStartOnly = strings.EqualFold(value, "yes") || strings.EqualFold(value, "true")
+			case "ExecCondition":
+				unit.Service.ExecCondition = append(unit.Service.ExecCondition, value)
 			case "ExecStartPre":
 				unit.Service.ExecStartPre = append(unit.Service.ExecStartPre, value)
+			case "ExecStartPost":
+				unit.Service.ExecStartPost = append(unit.Service.ExecStartPost, value)
 			case "ExecStart":
 				unit.Service.ExecStart = value
 			case "ExecStop":
 				unit.Service.ExecStop = value
+			case "ExecStopPost":
+				unit.Service.ExecStopPost = append(unit.Service.ExecStopPost, value)
 			case "ExecReload":
 				unit.Service.ExecReload = append(unit.Service.ExecReload, value)
 			case "Restart":
@@ -137,14 +222,46 @@ func ParseUnit(path string) (*Unit, error) {
 				unit.Service.RestartSec = value
 			case "RestartPreventExitStatus":
 				unit.Service.RestartPreventExitStatus = value
+			case "SuccessExitStatus":
+				unit.Service.SuccessExitStatus = value
 			case "PIDFile":
 				unit.Service.PIDFile = value
+			case "WorkingDirectory":
+				unit.Service.WorkingDirectory = value
+			case "RootDirectory":
+				unit.Service.RootDirectory = value
 			case "RuntimeDirectory":
-				unit.Service.RuntimeDirectory = value
+				unit.Service.RuntimeDirectory = splitList(value)
 			case "RuntimeDirectoryMode":
 				unit.Service.RuntimeDirectoryMode = value
+			case "StateDirectory":
+				unit.Service.StateDirectory = splitList(value)
+			case "CacheDirectory":
+				unit.Service.CacheDirectory = splitList(value)
+			case "LogsDirectory":
+				unit.Service.LogsDirectory = splitList(value)
+			case "ConfigurationDirectory":
+				unit.Service.ConfigurationDirectory = splitList(value)
 			case "KillMode":
 				unit.Service.KillMode = value
+			case "TimeoutStartSec":
+				unit.Service.TimeoutStartSec = value
+			case "TimeoutStopSec":
+				unit.Service.TimeoutStopSec = value
+			case "TimeoutSec":
+				unit.Service.TimeoutSec = value
+			case "User":
+				unit.Service.User = value
+			case "Group":
+				unit.Service.Group = value
+			case "SupplementaryGroups":
+				unit.Service.SupplementaryGroups = splitList(value)
+			case "UMask":
+				unit.Service.UMask = value
+			case "LimitNOFILE":
+				unit.Service.LimitNOFILE = value
+			default:
+				unit.Ignored["Service."+key] = value
 			case "Environment":
 				unit.Service.Environment = append(unit.Service.Environment, value)
 			case "EnvironmentFile":
@@ -158,13 +275,19 @@ func ParseUnit(path string) (*Unit, error) {
 				unit.Socket.ListenDatagram = append(unit.Socket.ListenDatagram, value)
 			case "SocketMode":
 				unit.Socket.SocketMode = value
+			default:
+				unit.Ignored["Socket."+key] = value
 			}
 
 		case "Install":
 			switch key {
 			case "WantedBy":
 				unit.Install.WantedBy = splitList(value)
+			default:
+				unit.Ignored["Install."+key] = value
 			}
+		default:
+			unit.Ignored[section+"."+key] = value
 		}
 	}
 

@@ -58,6 +58,6 @@ func (r *ProcessReaper) handleExit(pid int, status syscall.WaitStatus) {
 	delete(r.handlers, pid)
 	r.mu.Unlock()
 	if handler != nil {
-		handler(status)
+		go handler(status)
 	}
 }

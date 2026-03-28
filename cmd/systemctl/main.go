@@ -44,7 +44,7 @@ func main() {
 	client := &ipc.Client{SocketPath: *socketPath}
 
 	switch cmd {
-	case "start", "stop", "restart", "status", "is-active", "is-enabled", "enable", "disable":
+	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "enable", "disable":
 		if len(args) < 1 {
 			fmt.Fprintf(os.Stderr, "%s requires a unit name\n", cmd)
 			os.Exit(1)
@@ -59,6 +59,9 @@ func main() {
 
 	case "daemon-reload", "reboot", "poweroff", "halt":
 		handleSimple(client, cmd)
+
+	case "is-system-running":
+		handleIsSystemRunning(client)
 
 	default:
 		usage()
@@ -75,6 +78,30 @@ func handleSimple(client *ipc.Client, action string) {
 	if !resp.Success {
 		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
 		os.Exit(1)
+	}
+}
+
+func handleIsSystemRunning(client *ipc.Client) {
+	resp, err := client.Do(ipc.Request{Action: "is-system-running"})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if !resp.Success {
+		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+		os.Exit(1)
+	}
+
+	state := fmt.Sprintf("%v", resp.Data)
+	fmt.Println(state)
+
+	switch state {
+	case "running":
+		os.Exit(0)
+	case "degraded":
+		os.Exit(1)
+	default:
+		os.Exit(3)
 	}
 }
 
@@ -118,7 +145,22 @@ func handleUnitCommand(client *ipc.Client, action, unit string) {
 }
 
 func resolveUnitName(_ *ipc.Client, unit string) (string, error) {
-	if strings.HasSuffix(unit, ".service") || strings.Contains(unit, ".") {
+	knownSuffixes := []string{
+		".service",
+		".socket",
+		".target",
+		".mount",
+		".timer",
+		".path",
+		".slice",
+		".scope",
+	}
+	for _, suffix := range knownSuffixes {
+		if strings.HasSuffix(unit, suffix) {
+			return unit, nil
+		}
+	}
+	if strings.HasPrefix(unit, ".") {
 		return unit, nil
 	}
 	return unit + ".service", nil
@@ -141,10 +183,7 @@ func handleListUnits(client *ipc.Client) {
 
 	fmt.Printf("UNIT\tLOAD\tACTIVE\tDESCRIPTION\n")
 	for _, unit := range units {
-		active := "inactive"
-		if unit.State == "active" {
-			active = "active"
-		}
+		active := string(unit.State)
 		fmt.Printf("%s\tloaded\t%s\t%s\n", unit.Name, active, unit.Description)
 	}
 }
@@ -328,8 +367,10 @@ func printHelp() {
 	fmt.Println("  start UNIT...        Start (activate) one or more units")
 	fmt.Println("  stop UNIT...         Stop (deactivate) one or more units")
 	fmt.Println("  restart UNIT...      Restart one or more units")
+	fmt.Println("  reload UNIT...       Reload one or more units")
 	fmt.Println("  status UNIT...       Show runtime status of one or more units")
 	fmt.Println("  is-active UNIT...    Check whether units are active")
+	fmt.Println("  is-system-running    Check overall system state")
 	fmt.Println("  is-enabled UNIT...   Check whether unit files are enabled")
 	fmt.Println("  enable UNIT...       Enable one or more unit files")
 	fmt.Println("  disable UNIT...      Disable one or more unit files")
